@@ -23,9 +23,20 @@ from .swinir_runner import (
     InterruptController,
     PipelineOptions,
     PreviewOptions,
+    PROCESSING_MODE_GIMP_ONLY,
+    PROCESSING_MODE_GIMP_PRE_SWINIR,
+    PROCESSING_MODE_GIMP_PRE_SWINIR_GIMP_POST,
+    PROCESSING_MODE_SWINIR_ONLY,
     get_default_model_path,
     infer_model_descriptor,
     list_available_internal_scales,
+    normalize_processing_mode,
+    pipeline_uses_gimp_post,
+    pipeline_uses_gimp_pre,
+    pipeline_uses_swinir,
+    processing_mode_uses_gimp_post,
+    processing_mode_uses_gimp_pre,
+    processing_mode_uses_swinir,
     run_batch,
     run_comparison,
     run_preview,
@@ -43,6 +54,12 @@ PREVIEW_RANGES = (
     ("全体", "full"),
     ("中央crop", "center"),
     ("顔付近crop", "face_near"),
+)
+PROCESSING_MODE_CHOICES = (
+    ("GIMPのみ", PROCESSING_MODE_GIMP_ONLY),
+    ("SwinIRのみ", PROCESSING_MODE_SWINIR_ONLY),
+    ("GIMP前処理 + SwinIR", PROCESSING_MODE_GIMP_PRE_SWINIR),
+    ("GIMP前処理 + SwinIR + GIMP後処理", PROCESSING_MODE_GIMP_PRE_SWINIR_GIMP_POST),
 )
 CROP_RATIO_CHOICES = ("1:1", "4:5", "3:4", "2:3", "16:9", "9:16")
 NOISE_CHOICES = (
@@ -105,7 +122,7 @@ class TaskWorker(QtCore.QThread):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("SwinIR + GIMP 低侵襲高解像度化 GUI")
+        self.setWindowTitle("GIMP / SwinIR 低侵襲人物画像処理 GUI")
         self.resize(1380, 980)
         self._worker: TaskWorker | None = None
         self._available_scales = list_available_internal_scales()
@@ -116,6 +133,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._input_edit = QtWidgets.QLineEdit()
         self._output_edit = QtWidgets.QLineEdit(str(DEFAULT_OUTPUT_DIR))
         self._preview_source_edit = QtWidgets.QLineEdit()
+        self._processing_mode_combo = QtWidgets.QComboBox()
         self._scale_combo = QtWidgets.QComboBox()
         self._preview_range_combo = QtWidgets.QComboBox()
         self._preview_ratio_combo = QtWidgets.QComboBox()
@@ -130,6 +148,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._use_gimp_post_checkbox.setChecked(False)
         self._use_cutout_checkbox = QtWidgets.QCheckBox("人物切り抜きを使う")
         self._use_cutout_checkbox.setChecked(False)
+        self._use_gimp_pre_checkbox.hide()
+        self._use_gimp_post_checkbox.hide()
 
         self._collision_combo = QtWidgets.QComboBox()
         self._collision_combo.addItem("スキップ", "skip")
@@ -235,17 +255,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_gimp_status()
         self._refresh_model_info()
         self._update_detail_visibility()
+        self._update_mode_state()
 
     def _build_ui(self) -> None:
         intro_label = QtWidgets.QLabel(
-            "このツールは、GIMP で確認しながらノイズ除去とアンシャープマスクを調整し、"
-            " 顔を作り替えずに低侵襲な高解像度化を行うための GUI です。"
+            "このツールは、GIMP のノイズ除去とアンシャープマスクを軸に、"
+            " 顔を作り替えずに人物画像の見やすさ改善と必要時の高解像度化を行う GUI です。"
         )
         intro_label.setWordWrap(True)
 
         tips_label = QtWidgets.QLabel(
-            "最初は 顔付近crop プレビュー、GIMP前処理 ON、ノイズ除去 弱、アンシャープ 弱、"
-            " SwinIR 2x、GIMP後処理 OFF から確認してください。"
+            "最初は 顔付近crop プレビュー、処理モード GIMPのみ または GIMP前処理 + SwinIR、"
+            " ノイズ除去 弱、アンシャープ 弱 から確認してください。"
         )
         tips_label.setWordWrap(True)
 
@@ -254,6 +275,9 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         warning_label.setWordWrap(True)
         warning_label.setStyleSheet("color: #9a3b00;")
+
+        for label, value in PROCESSING_MODE_CHOICES:
+            self._processing_mode_combo.addItem(label, value)
 
         for scale in self._available_scales:
             self._scale_combo.addItem(f"{scale}x", scale)
@@ -294,28 +318,29 @@ class MainWindow(QtWidgets.QMainWindow):
         path_form.addWidget(QtWidgets.QLabel("プレビュー対象画像 / 比較用1枚"), 3, 0)
         path_form.addWidget(self._preview_source_edit, 3, 1)
         path_form.addWidget(preview_button, 3, 2)
-        path_form.addWidget(QtWidgets.QLabel("倍率"), 4, 0)
-        path_form.addWidget(self._scale_combo, 4, 1)
-        path_form.addWidget(QtWidgets.QLabel("プレビュー範囲"), 5, 0)
-        path_form.addWidget(self._preview_range_combo, 5, 1)
-        path_form.addWidget(QtWidgets.QLabel("プレビュー crop 比率"), 6, 0)
-        path_form.addWidget(self._preview_ratio_combo, 6, 1)
-        path_form.addWidget(QtWidgets.QLabel("同名出力時"), 7, 0)
-        path_form.addWidget(self._collision_combo, 7, 1)
-        path_form.addWidget(QtWidgets.QLabel("tile size"), 8, 0)
-        path_form.addWidget(self._tile_size_spin, 8, 1)
-        path_form.addWidget(QtWidgets.QLabel("tile overlap"), 9, 0)
-        path_form.addWidget(self._tile_overlap_spin, 9, 1)
-        path_form.addWidget(QtWidgets.QLabel("CPU/GPU 状態"), 10, 0)
-        path_form.addWidget(self._device_label, 10, 1, 1, 2)
-        path_form.addWidget(QtWidgets.QLabel("GIMP 状態"), 11, 0)
-        path_form.addWidget(self._gimp_status_label, 11, 1, 1, 2)
-        path_form.addWidget(QtWidgets.QLabel("内部 SwinIR モデル"), 12, 0)
-        path_form.addWidget(self._model_info_label, 12, 1, 1, 2)
+        path_form.addWidget(QtWidgets.QLabel("処理モード"), 4, 0)
+        path_form.addWidget(self._processing_mode_combo, 4, 1)
+        path_form.addWidget(QtWidgets.QLabel("倍率"), 5, 0)
+        path_form.addWidget(self._scale_combo, 5, 1)
+        path_form.addWidget(QtWidgets.QLabel("プレビュー範囲"), 6, 0)
+        path_form.addWidget(self._preview_range_combo, 6, 1)
+        path_form.addWidget(QtWidgets.QLabel("プレビュー crop 比率"), 7, 0)
+        path_form.addWidget(self._preview_ratio_combo, 7, 1)
+        path_form.addWidget(QtWidgets.QLabel("同名出力時"), 8, 0)
+        path_form.addWidget(self._collision_combo, 8, 1)
+        path_form.addWidget(QtWidgets.QLabel("tile size"), 9, 0)
+        path_form.addWidget(self._tile_size_spin, 9, 1)
+        path_form.addWidget(QtWidgets.QLabel("tile overlap"), 10, 0)
+        path_form.addWidget(self._tile_overlap_spin, 10, 1)
+        path_form.addWidget(QtWidgets.QLabel("CPU/GPU 状態"), 11, 0)
+        path_form.addWidget(self._device_label, 11, 1, 1, 2)
+        path_form.addWidget(QtWidgets.QLabel("GIMP 状態"), 12, 0)
+        path_form.addWidget(self._gimp_status_label, 12, 1, 1, 2)
+        path_form.addWidget(QtWidgets.QLabel("内部 SwinIR モデル"), 13, 0)
+        path_form.addWidget(self._model_info_label, 13, 1, 1, 2)
 
         pre_group = QtWidgets.QGroupBox("GIMP前処理")
         pre_layout = QtWidgets.QGridLayout(pre_group)
-        pre_layout.addWidget(self._use_gimp_pre_checkbox, 0, 0, 1, 2)
         pre_layout.addWidget(QtWidgets.QLabel("ノイズ除去"), 1, 0)
         pre_layout.addWidget(self._noise_combo, 1, 1)
         pre_layout.addWidget(QtWidgets.QLabel("ノイズ詳細 半径"), 2, 0)
@@ -336,19 +361,20 @@ class MainWindow(QtWidgets.QMainWindow):
         pre_layout.addWidget(self._pre_unsharp_threshold_spin, 9, 1)
 
         pre_note = QtWidgets.QLabel(
-            "GIMP 2 系では despeckle + unsharp、GIMP 3 系では GEGL noise-reduction + unsharp-mask を使います。"
+            "GIMPのみ / GIMP前処理 + SwinIR モードで使います。"
+            " GIMP 2 系では despeckle + unsharp、GIMP 3 系では GEGL noise-reduction + unsharp-mask を使います。"
         )
         pre_note.setWordWrap(True)
         pre_layout.addWidget(pre_note, 10, 0, 1, 2)
 
         post_group = QtWidgets.QGroupBox("後処理 / 切り抜き")
         post_layout = QtWidgets.QGridLayout(post_group)
-        post_layout.addWidget(self._use_gimp_post_checkbox, 0, 0, 1, 2)
         post_layout.addWidget(QtWidgets.QLabel("GIMP後処理の強さ"), 1, 0)
         post_layout.addWidget(self._post_unsharp_combo, 1, 1)
         post_layout.addWidget(self._use_cutout_checkbox, 2, 0, 1, 2)
         post_note = QtWidgets.QLabel(
-            "後処理は軽いアンシャープ中心です。人物切り抜きは PNG 透過で保存します。"
+            "GIMP後処理は「GIMP前処理 + SwinIR + GIMP後処理」モードで使います。"
+            " 人物切り抜きは処理モードとは別に ON/OFF でき、PNG 透過で保存します。"
         )
         post_note.setWordWrap(True)
         post_layout.addWidget(post_note, 3, 0, 1, 2)
@@ -424,6 +450,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._cancel_button.clicked.connect(self._request_cancel)
         self._save_settings_button.clicked.connect(self._save_current_settings)
         self._gimp_path_edit.editingFinished.connect(self._refresh_gimp_status)
+        self._processing_mode_combo.currentIndexChanged.connect(self._update_mode_state)
         self._scale_combo.currentIndexChanged.connect(self._refresh_model_info)
         self._noise_combo.currentIndexChanged.connect(self._update_detail_visibility)
         self._pre_unsharp_combo.currentIndexChanged.connect(self._update_detail_visibility)
@@ -473,6 +500,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._gimp_status_label.setStyleSheet("" if available else "color: #9a3b00;")
 
     def _refresh_model_info(self) -> None:
+        mode = self._selected_processing_mode()
+        if not processing_mode_uses_swinir(mode):
+            self._model_info_label.setText("SwinIR を使わない処理モードです。")
+            return
         scale = self._selected_scale()
         if scale <= 0:
             self._model_info_label.setText("内部モデルが見つかりません。setup.bat を再実行してください。")
@@ -486,12 +517,56 @@ class MainWindow(QtWidgets.QMainWindow):
             f"x{scale} 固定 / {descriptor.label} / {model_path.name}"
         )
 
+    def _selected_processing_mode(self) -> str:
+        return normalize_processing_mode(
+            str(self._processing_mode_combo.currentData() or PROCESSING_MODE_GIMP_PRE_SWINIR)
+        )
+
+    def _processing_mode_label(self, mode: str | None = None) -> str:
+        target_mode = normalize_processing_mode(mode or self._selected_processing_mode())
+        for label, value in PROCESSING_MODE_CHOICES:
+            if value == target_mode:
+                return label
+        return target_mode
+
     def _selected_scale(self) -> int:
         current_data = self._scale_combo.currentData()
         return int(current_data or 0)
 
     def _selected_preview_range(self) -> str:
         return str(self._preview_range_combo.currentData() or "face_near")
+
+    def _refresh_preview_captions(self) -> None:
+        mode = self._selected_processing_mode()
+        self._preview_caption_labels["original"].setText("元画像")
+        if mode == PROCESSING_MODE_GIMP_ONLY:
+            self._preview_caption_labels["gimp_pre"].setText("GIMP処理後")
+            self._preview_caption_labels["swinir"].setText("未使用")
+        elif mode == PROCESSING_MODE_SWINIR_ONLY:
+            self._preview_caption_labels["gimp_pre"].setText("未使用")
+            self._preview_caption_labels["swinir"].setText("SwinIR後")
+        else:
+            self._preview_caption_labels["gimp_pre"].setText("GIMP前処理後")
+            self._preview_caption_labels["swinir"].setText("SwinIRのみ参考")
+        self._preview_caption_labels["post"].setText("最終出力")
+
+    def _update_mode_state(self) -> None:
+        mode = self._selected_processing_mode()
+        uses_swinir = processing_mode_uses_swinir(mode)
+        uses_gimp_pre = processing_mode_uses_gimp_pre(mode)
+        uses_gimp_post = processing_mode_uses_gimp_post(mode)
+
+        self._scale_combo.setEnabled(uses_swinir and bool(self._available_scales))
+        self._tile_size_spin.setEnabled(uses_swinir)
+        self._tile_overlap_spin.setEnabled(uses_swinir)
+        self._noise_combo.setEnabled(uses_gimp_pre)
+        self._post_unsharp_combo.setEnabled(uses_gimp_post)
+        self._use_gimp_pre_checkbox.setChecked(uses_gimp_pre)
+        self._use_gimp_post_checkbox.setChecked(uses_gimp_post)
+
+        self._refresh_model_info()
+        self._refresh_preview_captions()
+        self._update_detail_visibility()
 
     def _build_noise_settings(self) -> NoiseReductionSettings:
         return NoiseReductionSettings(
@@ -524,6 +599,7 @@ class MainWindow(QtWidgets.QMainWindow):
             scale=self._selected_scale(),
             tile_size=int(self._tile_size_spin.value()),
             tile_overlap=int(self._tile_overlap_spin.value()),
+            processing_mode=self._selected_processing_mode(),
             gimp_path=Path(gimp_text) if gimp_text else None,
             use_gimp_pre=self._use_gimp_pre_checkbox.isChecked(),
             noise_settings=self._build_noise_settings(),
@@ -562,8 +638,12 @@ class MainWindow(QtWidgets.QMainWindow):
             pipeline=self._build_pipeline_options(),
         )
 
-    def _validate_before_run(self, *, for_preview: bool) -> bool:
-        if self._selected_scale() not in {2, 4}:
+    def _validate_before_run(self, *, task_kind: str) -> bool:
+        mode = self._selected_processing_mode()
+        requires_swinir = task_kind == "comparison" or processing_mode_uses_swinir(mode)
+        requires_gimp = task_kind == "comparison" or processing_mode_uses_gimp_pre(mode) or processing_mode_uses_gimp_post(mode)
+
+        if requires_swinir and self._selected_scale() not in {2, 4}:
             QtWidgets.QMessageBox.warning(
                 self,
                 "内部モデル",
@@ -573,7 +653,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._output_edit.text().strip():
             QtWidgets.QMessageBox.warning(self, "出力フォルダ", "出力フォルダを先に指定してください。")
             return False
-        if for_preview:
+        if task_kind in {"preview", "comparison"}:
             if not self._preview_source_edit.text().strip():
                 QtWidgets.QMessageBox.warning(
                     self,
@@ -586,13 +666,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.warning(self, "入力フォルダ", "入力フォルダを先に指定してください。")
                 return False
 
-        if self._use_gimp_pre_checkbox.isChecked() or self._use_gimp_post_checkbox.isChecked():
+        if requires_gimp:
             gimp_text = self._gimp_path_edit.text().strip()
             if not gimp_text:
                 QtWidgets.QMessageBox.warning(
                     self,
                     "GIMP パス",
-                    "GIMP 前処理または後処理を使う場合は、GIMP 実行ファイルを指定してください。",
+                    "この処理には GIMP が必要です。GIMP 実行ファイルを指定してください。",
                 )
                 return False
             available, message = is_gimp_available(Path(gimp_text))
@@ -622,19 +702,31 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
 
         pipeline = self._build_pipeline_options()
+        uses_swinir = pipeline_uses_swinir(pipeline)
+        uses_gimp_pre = pipeline_uses_gimp_pre(pipeline)
+        uses_gimp_post = pipeline_uses_gimp_post(pipeline)
         title = "テスト処理確認" if test_mode else "一括処理確認"
-        message = (
-            f"対象枚数: {min(file_count, 5) if test_mode else file_count}\n"
-            f"倍率: x{pipeline.scale}\n"
-            f"GIMP前処理: {'ON' if pipeline.use_gimp_pre else 'OFF'} / "
-            f"ノイズ={describe_noise_settings(pipeline.noise_settings)} / "
-            f"アンシャープ={describe_unsharp_settings(pipeline.pre_unsharp_settings)}\n"
-            f"GIMP後処理: {'ON' if pipeline.use_gimp_post else 'OFF'} / "
-            f"{pipeline.post_unsharp_settings.preset}\n"
-            f"人物切り抜き: {'ON' if pipeline.use_cutout else 'OFF'}\n"
-            f"tile size / overlap: {pipeline.tile_size} / {pipeline.tile_overlap}\n"
-            f"出力先: {self._output_edit.text().strip()}"
-        )
+        lines = [
+            f"対象枚数: {min(file_count, 5) if test_mode else file_count}",
+            f"処理モード: {self._processing_mode_label(pipeline.processing_mode)}",
+            (
+                f"GIMP前処理: {'ON' if uses_gimp_pre else 'OFF'} / "
+                f"ノイズ={describe_noise_settings(pipeline.noise_settings) if uses_gimp_pre else '-'} / "
+                f"アンシャープ={describe_unsharp_settings(pipeline.pre_unsharp_settings) if uses_gimp_pre else '-'}"
+            ),
+            (
+                f"GIMP後処理: {'ON' if uses_gimp_post else 'OFF'} / "
+                f"{pipeline.post_unsharp_settings.preset if uses_gimp_post else '-'}"
+            ),
+            f"人物切り抜き: {'ON' if pipeline.use_cutout else 'OFF'}",
+        ]
+        if uses_swinir:
+            lines.append(f"倍率: x{pipeline.scale}")
+            lines.append(f"tile size / overlap: {pipeline.tile_size} / {pipeline.tile_overlap}")
+        else:
+            lines.append("SwinIR: この処理では使いません")
+        lines.append(f"出力先: {self._output_edit.text().strip()}")
+        message = "\n".join(lines)
         answer = QtWidgets.QMessageBox.question(
             self,
             title,
@@ -647,7 +739,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _start_preview(self) -> None:
         if self._worker and self._worker.isRunning():
             return
-        if not self._validate_before_run(for_preview=True):
+        if not self._validate_before_run(task_kind="preview"):
             return
 
         options = self._build_preview_options()
@@ -657,19 +749,20 @@ class MainWindow(QtWidgets.QMainWindow):
     def _start_comparison(self) -> None:
         if self._worker and self._worker.isRunning():
             return
-        if not self._validate_before_run(for_preview=True):
+        if not self._validate_before_run(task_kind="comparison"):
             return
         options = self._build_comparison_options()
         task_callable = partial(run_comparison, options)
+        variant_count = 7 if self._use_cutout_checkbox.isChecked() else 5
         self._launch_worker(
             task_callable,
-            "1枚比較処理を開始します。comparison フォルダへ 6 パターンを出力します。",
+            f"1枚比較処理を開始します。comparison フォルダへ {variant_count} パターンを出力します。",
         )
 
     def _start_processing(self, *, test_mode: bool) -> None:
         if self._worker and self._worker.isRunning():
             return
-        if not self._validate_before_run(for_preview=False):
+        if not self._validate_before_run(task_kind="batch"):
             return
         if not self._confirm_batch_run(test_mode=test_mode):
             return
@@ -724,6 +817,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_running_state(False)
         self._progress_bar.setValue(100)
         self._preview_status_label.setText(payload.get("message", "プレビュー生成完了"))
+        self._refresh_preview_captions()
         self._load_preview_pixmap("original", payload.get("original_preview_path", ""))
         self._load_preview_pixmap("gimp_pre", payload.get("gimp_pre_preview_path", ""))
         self._load_preview_pixmap("swinir", payload.get("swinir_preview_path", ""))
@@ -776,7 +870,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _load_preview_pixmap(self, key: str, path_text: str) -> None:
         label = self._preview_image_labels[key]
         if not path_text:
-            label.setText("未生成")
+            label.setText("未使用" if self._preview_caption_labels[key].text() == "未使用" else "未生成")
             label.setPixmap(QtGui.QPixmap())
             return
         pixmap = QtGui.QPixmap(path_text)
@@ -793,6 +887,8 @@ class MainWindow(QtWidgets.QMainWindow):
         label.setText("")
 
     def _update_detail_visibility(self) -> None:
+        mode = self._selected_processing_mode()
+        uses_gimp_pre = processing_mode_uses_gimp_pre(mode)
         noise_is_detail = str(self._noise_combo.currentData()) == "detail"
         pre_unsharp_is_detail = str(self._pre_unsharp_combo.currentData()) == "detail"
         for widget in (
@@ -801,13 +897,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self._noise_white_spin,
             self._noise_iterations_spin,
         ):
-            widget.setEnabled(noise_is_detail)
+            widget.setEnabled(uses_gimp_pre and noise_is_detail)
         for widget in (
             self._pre_unsharp_radius_spin,
             self._pre_unsharp_amount_spin,
             self._pre_unsharp_threshold_spin,
         ):
-            widget.setEnabled(pre_unsharp_is_detail)
+            widget.setEnabled(uses_gimp_pre and pre_unsharp_is_detail)
 
     def _save_current_settings(self) -> None:
         data = {
@@ -815,6 +911,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "input_dir": self._input_edit.text().strip(),
             "output_dir": self._output_edit.text().strip(),
             "preview_source": self._preview_source_edit.text().strip(),
+            "processing_mode": self._selected_processing_mode(),
             "scale": self._selected_scale(),
             "preview_range": self._selected_preview_range(),
             "preview_ratio": str(
@@ -854,6 +951,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self._output_edit.setText(str(data.get("output_dir", DEFAULT_OUTPUT_DIR)))
         self._preview_source_edit.setText(str(data.get("preview_source", "")))
 
+        saved_mode = str(data.get("processing_mode", "")).strip()
+        if not saved_mode:
+            use_gimp_pre = bool(data.get("use_gimp_pre", True))
+            use_gimp_post = bool(data.get("use_gimp_post", False))
+            if use_gimp_pre and use_gimp_post:
+                saved_mode = PROCESSING_MODE_GIMP_PRE_SWINIR_GIMP_POST
+            elif use_gimp_pre:
+                saved_mode = PROCESSING_MODE_GIMP_PRE_SWINIR
+            else:
+                saved_mode = PROCESSING_MODE_SWINIR_ONLY
+        mode_index = self._processing_mode_combo.findData(saved_mode)
+        if mode_index >= 0:
+            self._processing_mode_combo.setCurrentIndex(mode_index)
+
         scale = int(data.get("scale", 2 if 2 in self._available_scales else (self._available_scales[0] if self._available_scales else 0)))
         scale_index = self._scale_combo.findData(scale)
         if scale_index >= 0:
@@ -873,7 +984,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._skip_checkbox.setChecked(bool(data.get("skip_existing", True)))
         self._recursive_checkbox.setChecked(bool(data.get("recursive", False)))
 
-        self._use_gimp_pre_checkbox.setChecked(bool(data.get("use_gimp_pre", True)))
         noise_index = self._noise_combo.findData(str(data.get("noise_preset", "weak")))
         if noise_index >= 0:
             self._noise_combo.setCurrentIndex(noise_index)
@@ -889,11 +999,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pre_unsharp_amount_spin.setValue(float(data.get("pre_unsharp_amount", 0.35)))
         self._pre_unsharp_threshold_spin.setValue(float(data.get("pre_unsharp_threshold", 0.02)))
 
-        self._use_gimp_post_checkbox.setChecked(bool(data.get("use_gimp_post", False)))
         post_index = self._post_unsharp_combo.findData(str(data.get("post_unsharp_preset", "off")))
         if post_index >= 0:
             self._post_unsharp_combo.setCurrentIndex(post_index)
         self._use_cutout_checkbox.setChecked(bool(data.get("use_cutout", False)))
+        self._update_mode_state()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # pragma: no cover - GUI behavior
         self._save_current_settings()

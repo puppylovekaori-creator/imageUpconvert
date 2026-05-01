@@ -56,6 +56,22 @@ VENDOR_NETWORK_PATH = APP_ROOT / "vendor" / "SwinIR" / "models" / "network_swini
 PREVIEW_ROOT = APP_ROOT / "temp" / "preview"
 WHO_VALUE = "imageUpconvert"
 SUPPORTED_PREVIEW_RANGES = {"full", "center", "face_near"}
+PROCESSING_MODE_GIMP_ONLY = "gimp_only"
+PROCESSING_MODE_SWINIR_ONLY = "swinir_only"
+PROCESSING_MODE_GIMP_PRE_SWINIR = "gimp_pre_swinir"
+PROCESSING_MODE_GIMP_PRE_SWINIR_GIMP_POST = "gimp_pre_swinir_gimp_post"
+SUPPORTED_PROCESSING_MODES = {
+    PROCESSING_MODE_GIMP_ONLY,
+    PROCESSING_MODE_SWINIR_ONLY,
+    PROCESSING_MODE_GIMP_PRE_SWINIR,
+    PROCESSING_MODE_GIMP_PRE_SWINIR_GIMP_POST,
+}
+PROCESSING_MODE_LABELS = {
+    PROCESSING_MODE_GIMP_ONLY: "GIMPのみ",
+    PROCESSING_MODE_SWINIR_ONLY: "SwinIRのみ",
+    PROCESSING_MODE_GIMP_PRE_SWINIR: "GIMP前処理 + SwinIR",
+    PROCESSING_MODE_GIMP_PRE_SWINIR_GIMP_POST: "GIMP前処理 + SwinIR + GIMP後処理",
+}
 
 
 class UserCancelledError(RuntimeError):
@@ -67,6 +83,7 @@ class PipelineOptions:
     scale: int
     tile_size: int
     tile_overlap: int
+    processing_mode: str = PROCESSING_MODE_GIMP_PRE_SWINIR
     gimp_path: Path | None = None
     use_gimp_pre: bool = True
     noise_settings: NoiseReductionSettings = field(default_factory=NoiseReductionSettings)
@@ -180,6 +197,53 @@ class PipelineExecutionResult:
     warning_message: str
     gimp_pre_log: StageLog
     gimp_post_log: StageLog
+
+
+def normalize_processing_mode(value: str) -> str:
+    mode = (value or PROCESSING_MODE_GIMP_PRE_SWINIR).strip().lower()
+    if mode not in SUPPORTED_PROCESSING_MODES:
+        raise ValueError(f"未対応の処理モードです: {value}")
+    return mode
+
+
+def processing_mode_uses_swinir(mode: str) -> bool:
+    normalized = normalize_processing_mode(mode)
+    return normalized in {
+        PROCESSING_MODE_SWINIR_ONLY,
+        PROCESSING_MODE_GIMP_PRE_SWINIR,
+        PROCESSING_MODE_GIMP_PRE_SWINIR_GIMP_POST,
+    }
+
+
+def processing_mode_uses_gimp_pre(mode: str) -> bool:
+    normalized = normalize_processing_mode(mode)
+    return normalized in {
+        PROCESSING_MODE_GIMP_ONLY,
+        PROCESSING_MODE_GIMP_PRE_SWINIR,
+        PROCESSING_MODE_GIMP_PRE_SWINIR_GIMP_POST,
+    }
+
+
+def processing_mode_uses_gimp_post(mode: str) -> bool:
+    normalized = normalize_processing_mode(mode)
+    return normalized == PROCESSING_MODE_GIMP_PRE_SWINIR_GIMP_POST
+
+
+def pipeline_uses_swinir(pipeline: PipelineOptions) -> bool:
+    return processing_mode_uses_swinir(pipeline.processing_mode)
+
+
+def pipeline_uses_gimp_pre(pipeline: PipelineOptions) -> bool:
+    return processing_mode_uses_gimp_pre(pipeline.processing_mode)
+
+
+def pipeline_uses_gimp_post(pipeline: PipelineOptions) -> bool:
+    return processing_mode_uses_gimp_post(pipeline.processing_mode)
+
+
+def describe_processing_mode(mode: str) -> str:
+    normalized = normalize_processing_mode(mode)
+    return PROCESSING_MODE_LABELS[normalized]
 
 
 class InterruptController:
@@ -304,16 +368,19 @@ def list_available_internal_scales() -> list[int]:
 
 
 def validate_pipeline_options(options: PipelineOptions) -> None:
-    if options.scale not in {2, 4}:
-        raise ValueError("倍率は 2x または 4x のみ対応です。")
+    mode = normalize_processing_mode(options.processing_mode)
     if options.tile_size < 0 or options.tile_overlap < 0:
         raise ValueError("tile size と tile overlap は 0 以上で指定してください。")
-    model_path = get_default_model_path(options.scale)
-    if not model_path.exists() or not model_path.is_file():
-        raise ValueError(f"内部モデルが見つかりません: {model_path}")
-    if options.use_gimp_pre or options.use_gimp_post:
+    if processing_mode_uses_swinir(mode):
+        if options.scale not in {2, 4}:
+            raise ValueError("倍率は 2x または 4x のみ対応です。")
+        model_path = get_default_model_path(options.scale)
+        if not model_path.exists() or not model_path.is_file():
+            raise ValueError(f"内部モデルが見つかりません: {model_path}")
+    if processing_mode_uses_gimp_pre(mode) or processing_mode_uses_gimp_post(mode):
         validate_gimp_path(options.gimp_path)
-    normalize_post_unsharp_preset(options.post_unsharp_settings.preset)
+    if processing_mode_uses_gimp_post(mode):
+        normalize_post_unsharp_preset(options.post_unsharp_settings.preset)
 
 
 def validate_batch_options(options: BatchOptions) -> None:
@@ -340,7 +407,13 @@ def validate_preview_options(options: PreviewOptions) -> None:
 def validate_comparison_options(options: ComparisonOptions) -> None:
     if not options.input_file.exists() or not options.input_file.is_file():
         raise ValueError("比較対象画像が存在しません。")
-    validate_pipeline_options(options.pipeline)
+    if options.pipeline.scale not in {2, 4}:
+        raise ValueError("比較処理の倍率は 2x または 4x のみ対応です。")
+    model_path = get_default_model_path(options.pipeline.scale)
+    if not model_path.exists() or not model_path.is_file():
+        raise ValueError(f"比較処理用の内部モデルが見つかりません: {model_path}")
+    validate_gimp_path(options.pipeline.gimp_path)
+    normalize_post_unsharp_preset(options.pipeline.post_unsharp_settings.preset)
 
 
 def get_effective_output_dir(options: BatchOptions) -> Path:
@@ -658,11 +731,12 @@ def execute_pipeline(
     *,
     input_path: Path,
     pipeline: PipelineOptions,
-    model_cache: ModelRuntimeCache,
+    model_cache: ModelRuntimeCache | None,
     controller: InterruptController,
     preview_range: str = "full",
     preview_ratio: str = "4:5",
 ) -> PipelineExecutionResult:
+    mode = normalize_processing_mode(pipeline.processing_mode)
     prepared = prepare_image(
         input_path,
         preview_range=preview_range,
@@ -674,10 +748,10 @@ def execute_pipeline(
 
     temp_dir = _make_work_dir("imageupconvert_")
     try:
-        gimp_pre_state = original_state
-        if pipeline.use_gimp_pre:
+        current_state = original_state
+        if processing_mode_uses_gimp_pre(mode):
             controller.raise_if_cancelled()
-            gimp_pre_state, gimp_pre_log = _apply_gimp_stage(
+            current_state, gimp_pre_log = _apply_gimp_stage(
                 state=original_state,
                 gimp_path=Path(pipeline.gimp_path) if pipeline.gimp_path is not None else None,  # type: ignore[arg-type]
                 noise_settings=pipeline.noise_settings,
@@ -687,20 +761,33 @@ def execute_pipeline(
                 controller=controller,
             )
 
-        upscaled_state, actual_scale, warning_message = _upscale_state(
-            state=gimp_pre_state,
-            scale=pipeline.scale,
-            tile_size=pipeline.tile_size,
-            tile_overlap=pipeline.tile_overlap,
-            model_cache=model_cache,
-            controller=controller,
-        )
+        actual_scale = "1.0000x1.0000"
+        warning_message = ""
+        if processing_mode_uses_swinir(mode):
+            if model_cache is None:
+                raise RuntimeError("SwinIR を使う処理モードですが、モデル実行環境を初期化できませんでした。")
+            current_state, actual_scale, warning_message = _upscale_state(
+                state=current_state,
+                scale=pipeline.scale,
+                tile_size=pipeline.tile_size,
+                tile_overlap=pipeline.tile_overlap,
+                model_cache=model_cache,
+                controller=controller,
+            )
+        else:
+            current_height, current_width = current_state.rgb.shape[:2]
+            actual_scale, warning_message = format_actual_scale(
+                processing_width=prepared.processing_width,
+                processing_height=prepared.processing_height,
+                actual_width=current_width,
+                actual_height=current_height,
+                requested_scale=1,
+            )
 
-        final_state = upscaled_state
-        if pipeline.use_gimp_post:
+        if processing_mode_uses_gimp_post(mode):
             controller.raise_if_cancelled()
-            final_state, gimp_post_log = _apply_gimp_stage(
-                state=final_state,
+            current_state, gimp_post_log = _apply_gimp_stage(
+                state=current_state,
                 gimp_path=Path(pipeline.gimp_path) if pipeline.gimp_path is not None else None,  # type: ignore[arg-type]
                 noise_settings=NoiseReductionSettings(preset="off"),
                 unsharp_settings=pipeline.post_unsharp_settings,
@@ -711,12 +798,12 @@ def execute_pipeline(
 
         if pipeline.use_cutout:
             controller.raise_if_cancelled()
-            cutout_rgb, cutout_alpha = apply_person_cutout(final_state.rgb, final_state.alpha)
-            final_state = ImageState(cutout_rgb, cutout_alpha)
+            cutout_rgb, cutout_alpha = apply_person_cutout(current_state.rgb, current_state.alpha)
+            current_state = ImageState(cutout_rgb, cutout_alpha)
 
         return PipelineExecutionResult(
             prepared=prepared,
-            final_state=final_state,
+            final_state=current_state,
             actual_scale=actual_scale,
             warning_message=warning_message,
             gimp_pre_log=gimp_pre_log,
@@ -729,17 +816,22 @@ def execute_pipeline(
 def make_log_row(
     *,
     task_kind: str,
+    processing_mode: str,
     processed_at: str,
     input_path: Path,
     output_path: Path | None,
     original_size: str,
     processing_input_size: str,
     output_size: str,
-    requested_scale: int,
+    requested_scale: int | None,
     actual_scale: str,
-    model_path: Path,
+    model_path: Path | None,
     pipeline: PipelineOptions,
     prepared: PreparedImage | None,
+    swinir_used: bool,
+    gimp_pre_used: bool,
+    gimp_post_used: bool,
+    cutout_used: bool,
     gimp_pre_log: StageLog,
     gimp_post_log: StageLog,
     result: str,
@@ -751,14 +843,16 @@ def make_log_row(
         "who": WHO_VALUE,
         "processed_at": processed_at,
         "task_kind": task_kind,
+        "processing_mode": normalize_processing_mode(processing_mode),
         "input_file_path": str(input_path),
         "output_file_path": str(output_path) if output_path else "",
         "original_image_size": original_size,
         "processing_input_size": processing_input_size,
         "output_image_size": output_size,
-        "requested_scale": str(requested_scale),
+        "requested_scale": str(requested_scale) if requested_scale is not None else "",
         "actual_scale": actual_scale,
-        "model": str(model_path),
+        "swinir_enabled": "yes" if swinir_used else "no",
+        "model": str(model_path) if model_path is not None else "",
         "tile_size": str(pipeline.tile_size),
         "tile_overlap": str(pipeline.tile_overlap),
         "alpha_present": prepared.alpha_present if prepared is not None else "",
@@ -766,14 +860,14 @@ def make_log_row(
         "preview_crop_range": prepared.preview_crop_range if prepared is not None else "",
         "gimp_path": str(pipeline.gimp_path) if pipeline.gimp_path else "",
         "gimp_version": gimp_post_log.version_text or gimp_pre_log.version_text,
-        "gimp_pre_enabled": "yes" if pipeline.use_gimp_pre else "no",
-        "noise_reduction_setting": describe_noise_settings(pipeline.noise_settings),
-        "unsharp_pre_setting": describe_unsharp_settings(pipeline.pre_unsharp_settings),
-        "gimp_post_enabled": "yes" if pipeline.use_gimp_post else "no",
+        "gimp_pre_enabled": "yes" if gimp_pre_used else "no",
+        "noise_reduction_setting": describe_noise_settings(pipeline.noise_settings) if gimp_pre_used else "",
+        "unsharp_pre_setting": describe_unsharp_settings(pipeline.pre_unsharp_settings) if gimp_pre_used else "",
+        "gimp_post_enabled": "yes" if gimp_post_used else "no",
         "unsharp_post_setting": describe_unsharp_settings(
             pipeline.post_unsharp_settings, allow_detail=False
-        ),
-        "cutout_enabled": "yes" if pipeline.use_cutout else "no",
+        ) if gimp_post_used else "",
+        "cutout_enabled": "yes" if cutout_used else "no",
         "gimp_pre_exit_code": str(gimp_pre_log.exit_code) if gimp_pre_log.used else "",
         "gimp_pre_stdout": gimp_pre_log.stdout.replace("\r", " ").replace("\n", " ").strip(),
         "gimp_pre_stderr": gimp_pre_log.stderr.replace("\r", " ").replace("\n", " ").strip(),
@@ -788,11 +882,15 @@ def make_log_row(
 
 
 def _build_batch_output_suffix(pipeline: PipelineOptions) -> str:
-    suffix = f"_swinir_x{pipeline.scale}"
-    if pipeline.use_gimp_pre:
-        suffix += "_gimp_pre"
-    if pipeline.use_gimp_post:
-        suffix += "_gimp_post"
+    mode = normalize_processing_mode(pipeline.processing_mode)
+    if mode == PROCESSING_MODE_GIMP_ONLY:
+        suffix = "_gimp_only"
+    elif mode == PROCESSING_MODE_SWINIR_ONLY:
+        suffix = f"_swinir_x{pipeline.scale}"
+    elif mode == PROCESSING_MODE_GIMP_PRE_SWINIR:
+        suffix = f"_gimp_pre_swinir_x{pipeline.scale}"
+    else:
+        suffix = f"_gimp_pre_swinir_x{pipeline.scale}_gimp_post"
     if pipeline.use_cutout:
         suffix += "_cutout"
     return suffix
@@ -830,12 +928,14 @@ def run_batch(
     message_callback: Callable[[str], None] | None = None,
     controller: InterruptController | None = None,
 ) -> RunSummary:
-    ensure_torch_available()
     validate_batch_options(options)
 
     progress_callback = progress_callback or (lambda payload: None)
     message_callback = message_callback or (lambda message: None)
     controller = controller or InterruptController()
+    mode = normalize_processing_mode(options.pipeline.processing_mode)
+    if processing_mode_uses_swinir(mode):
+        ensure_torch_available()
 
     output_dir = get_effective_output_dir(options)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -848,8 +948,8 @@ def run_batch(
     if not files:
         raise ValueError("入力フォルダ内に対応画像が見つかりませんでした。")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model_cache = ModelRuntimeCache(device, message_callback)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu") if processing_mode_uses_swinir(mode) else None
+    model_cache = ModelRuntimeCache(device, message_callback) if device is not None else None
     logger = CsvLogger(output_dir)
     summary = RunSummary(
         kind="run",
@@ -863,10 +963,15 @@ def run_batch(
         output_dir=str(output_dir),
     )
 
-    model_path = get_default_model_path(options.pipeline.scale)
+    model_path = get_default_model_path(options.pipeline.scale) if processing_mode_uses_swinir(mode) else None
     message_callback(f"出力先: {output_dir}")
-    message_callback(f"使用デバイス: {device}")
-    message_callback(f"内部モデル: {model_path.name}")
+    message_callback(f"処理モード: {describe_processing_mode(mode)}")
+    if device is not None:
+        message_callback(f"使用デバイス: {device}")
+    if model_path is not None:
+        message_callback(f"内部モデル: {model_path.name}")
+    else:
+        message_callback("SwinIR: この処理モードでは使いません。")
 
     try:
         for index, input_path in enumerate(files, start=1):
@@ -898,17 +1003,22 @@ def run_batch(
             if output_path is None:
                 row = make_log_row(
                     task_kind="batch",
+                    processing_mode=mode,
                     processed_at=processed_at,
                     input_path=input_path,
                     output_path=None,
                     original_size="",
                     processing_input_size="",
                     output_size="",
-                    requested_scale=options.pipeline.scale,
+                    requested_scale=options.pipeline.scale if processing_mode_uses_swinir(mode) else None,
                     actual_scale="",
                     model_path=model_path,
                     pipeline=options.pipeline,
                     prepared=None,
+                    swinir_used=processing_mode_uses_swinir(mode),
+                    gimp_pre_used=processing_mode_uses_gimp_pre(mode),
+                    gimp_post_used=processing_mode_uses_gimp_post(mode),
+                    cutout_used=options.pipeline.use_cutout,
                     gimp_pre_log=StageLog(),
                     gimp_post_log=StageLog(),
                     result="skipped",
@@ -941,6 +1051,7 @@ def run_batch(
                 row_result = "processed_warning" if result.warning_message else "processed"
                 row = make_log_row(
                     task_kind="batch",
+                    processing_mode=mode,
                     processed_at=processed_at,
                     input_path=input_path,
                     output_path=output_path,
@@ -949,11 +1060,15 @@ def run_batch(
                         result.prepared.processing_width, result.prepared.processing_height
                     ),
                     output_size=format_size(output_width, output_height),
-                    requested_scale=options.pipeline.scale,
+                    requested_scale=options.pipeline.scale if processing_mode_uses_swinir(mode) else None,
                     actual_scale=result.actual_scale,
                     model_path=model_path,
                     pipeline=options.pipeline,
                     prepared=result.prepared,
+                    swinir_used=processing_mode_uses_swinir(mode),
+                    gimp_pre_used=processing_mode_uses_gimp_pre(mode),
+                    gimp_post_used=processing_mode_uses_gimp_post(mode),
+                    cutout_used=options.pipeline.use_cutout,
                     gimp_pre_log=result.gimp_pre_log,
                     gimp_post_log=result.gimp_post_log,
                     result=row_result,
@@ -983,17 +1098,22 @@ def run_batch(
                 failed_copy_path = copy_failed_file(input_path, options.input_dir, failed_root)
                 row = make_log_row(
                     task_kind="batch",
+                    processing_mode=mode,
                     processed_at=processed_at,
                     input_path=input_path,
                     output_path=output_path,
                     original_size="",
                     processing_input_size="",
                     output_size="",
-                    requested_scale=options.pipeline.scale,
+                    requested_scale=options.pipeline.scale if processing_mode_uses_swinir(mode) else None,
                     actual_scale="",
                     model_path=model_path,
                     pipeline=options.pipeline,
                     prepared=None,
+                    swinir_used=processing_mode_uses_swinir(mode),
+                    gimp_pre_used=processing_mode_uses_gimp_pre(mode),
+                    gimp_post_used=processing_mode_uses_gimp_post(mode),
+                    cutout_used=options.pipeline.use_cutout,
                     gimp_pre_log=StageLog(),
                     gimp_post_log=StageLog(),
                     result="failed",
@@ -1028,24 +1148,34 @@ def _save_preview_outputs(
     input_file: Path,
     *,
     original_state: ImageState,
-    gimp_pre_state: ImageState,
-    swinir_state: ImageState,
-    post_state: ImageState,
-    scale: int,
+    gimp_pre_state: ImageState | None,
+    swinir_state: ImageState | None,
+    final_state: ImageState,
+    scale: int | None,
     preview_range: str,
-) -> tuple[Path, Path, Path, Path]:
+) -> tuple[str, str, str, str]:
     preview_dir.mkdir(parents=True, exist_ok=True)
     safe_stem = input_file.stem
     range_suffix = preview_range
     original_path = preview_dir / f"{safe_stem}_{range_suffix}_original.png"
-    gimp_pre_path = preview_dir / f"{safe_stem}_{range_suffix}_gimp_pre.png"
-    swinir_path = preview_dir / f"{safe_stem}_{range_suffix}_swinir_x{scale}.png"
-    post_path = preview_dir / f"{safe_stem}_{range_suffix}_swinir_x{scale}_gimp_post.png"
     _save_state(original_path, original_state)
-    _save_state(gimp_pre_path, gimp_pre_state)
-    _save_state(swinir_path, swinir_state)
-    _save_state(post_path, post_state)
-    return original_path, gimp_pre_path, swinir_path, post_path
+
+    gimp_pre_path = ""
+    if gimp_pre_state is not None:
+        gimp_pre_target = preview_dir / f"{safe_stem}_{range_suffix}_gimp_pre.png"
+        _save_state(gimp_pre_target, gimp_pre_state)
+        gimp_pre_path = str(gimp_pre_target)
+
+    swinir_path = ""
+    if swinir_state is not None:
+        scale_suffix = f"_x{scale}" if scale is not None else ""
+        swinir_target = preview_dir / f"{safe_stem}_{range_suffix}_swinir{scale_suffix}.png"
+        _save_state(swinir_target, swinir_state)
+        swinir_path = str(swinir_target)
+
+    final_target = preview_dir / f"{safe_stem}_{range_suffix}_final.png"
+    _save_state(final_target, final_state)
+    return str(original_path), gimp_pre_path, swinir_path, str(final_target)
 
 
 def run_preview(
@@ -1055,15 +1185,17 @@ def run_preview(
     message_callback: Callable[[str], None] | None = None,
     controller: InterruptController | None = None,
 ) -> PreviewSummary:
-    ensure_torch_available()
     validate_preview_options(options)
 
     progress_callback = progress_callback or (lambda payload: None)
     message_callback = message_callback or (lambda message: None)
     controller = controller or InterruptController()
+    mode = normalize_processing_mode(options.pipeline.processing_mode)
+    if processing_mode_uses_swinir(mode):
+        ensure_torch_available()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model_cache = ModelRuntimeCache(device, message_callback)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu") if processing_mode_uses_swinir(mode) else None
+    model_cache = ModelRuntimeCache(device, message_callback) if device is not None else None
 
     progress_callback({"phase": "started", "completed": 0, "total": 1, "path": str(options.input_file)})
     prepared = prepare_image(
@@ -1072,11 +1204,13 @@ def run_preview(
         preview_ratio=options.preview_ratio,
     )
     original_state = ImageState(prepared.rgb, prepared.alpha)
-    gimp_pre_state = original_state
+    gimp_pre_state: ImageState | None = None
+    swinir_reference_state: ImageState | None = None
+    final_state = original_state
 
     temp_dir = _make_work_dir("imageupconvert_preview_")
     try:
-        if options.pipeline.use_gimp_pre:
+        if processing_mode_uses_gimp_pre(mode):
             gimp_pre_state, _ = _apply_gimp_stage(
                 state=original_state,
                 gimp_path=Path(options.pipeline.gimp_path) if options.pipeline.gimp_path is not None else None,  # type: ignore[arg-type]
@@ -1086,28 +1220,31 @@ def run_preview(
                 prefix="preview_pre",
                 controller=controller,
             )
+            final_state = gimp_pre_state
 
-        swinir_state, _, _ = _upscale_state(
-            state=original_state,
-            scale=options.pipeline.scale,
-            tile_size=options.pipeline.tile_size,
-            tile_overlap=options.pipeline.tile_overlap,
-            model_cache=model_cache,
-            controller=controller,
-        )
-        post_state = swinir_state
-        if options.pipeline.use_gimp_pre:
-            post_state, _, _ = _upscale_state(
-                state=gimp_pre_state,
+        if processing_mode_uses_swinir(mode):
+            if model_cache is None:
+                raise RuntimeError("SwinIR プレビュー環境を初期化できませんでした。")
+            swinir_reference_state, _, _ = _upscale_state(
+                state=original_state,
                 scale=options.pipeline.scale,
                 tile_size=options.pipeline.tile_size,
                 tile_overlap=options.pipeline.tile_overlap,
                 model_cache=model_cache,
                 controller=controller,
             )
-        if options.pipeline.use_gimp_post:
-            post_state, _ = _apply_gimp_stage(
-                state=post_state,
+            final_input_state = gimp_pre_state if gimp_pre_state is not None else original_state
+            final_state, _, _ = _upscale_state(
+                state=final_input_state,
+                scale=options.pipeline.scale,
+                tile_size=options.pipeline.tile_size,
+                tile_overlap=options.pipeline.tile_overlap,
+                model_cache=model_cache,
+                controller=controller,
+            )
+        if processing_mode_uses_gimp_post(mode):
+            final_state, _ = _apply_gimp_stage(
+                state=final_state,
                 gimp_path=Path(options.pipeline.gimp_path) if options.pipeline.gimp_path is not None else None,  # type: ignore[arg-type]
                 noise_settings=NoiseReductionSettings(preset="off"),
                 unsharp_settings=options.pipeline.post_unsharp_settings,
@@ -1115,15 +1252,18 @@ def run_preview(
                 prefix="preview_post",
                 controller=controller,
             )
+        if options.pipeline.use_cutout:
+            cutout_rgb, cutout_alpha = apply_person_cutout(final_state.rgb, final_state.alpha)
+            final_state = ImageState(cutout_rgb, cutout_alpha)
 
         original_path, gimp_pre_path, swinir_path, post_path = _save_preview_outputs(
             options.preview_dir,
             options.input_file,
             original_state=original_state,
             gimp_pre_state=gimp_pre_state,
-            swinir_state=swinir_state,
-            post_state=post_state,
-            scale=options.pipeline.scale,
+            swinir_state=swinir_reference_state,
+            final_state=final_state,
+            scale=options.pipeline.scale if processing_mode_uses_swinir(mode) else None,
             preview_range=options.preview_range,
         )
     finally:
@@ -1131,18 +1271,22 @@ def run_preview(
 
     progress_callback({"phase": "finished", "completed": 1, "total": 1, "path": str(options.input_file)})
     message = (
-        f"プレビュー生成完了: {options.input_file.name} / 範囲={options.preview_range} / x{options.pipeline.scale}"
+        f"プレビュー生成完了: {options.input_file.name}"
+        f" / 範囲={options.preview_range}"
+        f" / 処理モード={describe_processing_mode(mode)}"
     )
+    if processing_mode_uses_swinir(mode):
+        message += f" / x{options.pipeline.scale}"
     message_callback(message)
     return PreviewSummary(
         kind="preview",
         input_file=str(options.input_file),
         preview_range=options.preview_range,
-        scale=options.pipeline.scale,
-        original_preview_path=str(original_path),
-        gimp_pre_preview_path=str(gimp_pre_path),
-        swinir_preview_path=str(swinir_path),
-        post_preview_path=str(post_path),
+        scale=options.pipeline.scale if processing_mode_uses_swinir(mode) else 1,
+        original_preview_path=original_path,
+        gimp_pre_preview_path=gimp_pre_path,
+        swinir_preview_path=swinir_path,
+        post_preview_path=post_path,
         message=message,
     )
 
@@ -1170,17 +1314,17 @@ def run_comparison(
     model_cache = ModelRuntimeCache(device, message_callback)
     model_path = get_default_model_path(options.pipeline.scale)
 
-    variant_specs = (
-        "original",
-        "gimp_pre",
-        "swinir_only",
-        "gimp_pre_swinir",
-        "gimp_pre_swinir_gimp_post",
-        "gimp_pre_swinir_gimp_post_cutout",
+    prepared = prepare_image(
+        options.input_file,
+        preview_range="full",
+        preview_ratio="4:5",
     )
+    original_state = ImageState(prepared.rgb, prepared.alpha)
+    gimp_pre_log = StageLog()
+    gimp_post_log = StageLog()
     summary = RunSummary(
         kind="run",
-        total_files=len(variant_specs),
+        total_files=0,
         processed=0,
         skipped=0,
         failed=0,
@@ -1190,31 +1334,20 @@ def run_comparison(
         output_dir=str(output_dir),
     )
 
-    prepared = prepare_image(
-        options.input_file,
-        preview_range="full",
-        preview_ratio="4:5",
-    )
-    original_state = ImageState(prepared.rgb, prepared.alpha)
-    gimp_pre_state = original_state
-    gimp_pre_log = StageLog()
-    gimp_post_log = StageLog()
-
     try:
         temp_dir = _make_work_dir("imageupconvert_compare_")
         try:
-            if options.pipeline.use_gimp_pre:
-                gimp_pre_state, gimp_pre_log = _apply_gimp_stage(
-                    state=original_state,
-                    gimp_path=Path(options.pipeline.gimp_path) if options.pipeline.gimp_path is not None else None,  # type: ignore[arg-type]
-                    noise_settings=options.pipeline.noise_settings,
-                    unsharp_settings=options.pipeline.pre_unsharp_settings,
-                    temp_dir=temp_dir,
-                    prefix="comparison_pre",
-                    controller=controller,
-                )
+            gimp_only_state, gimp_pre_log = _apply_gimp_stage(
+                state=original_state,
+                gimp_path=Path(options.pipeline.gimp_path) if options.pipeline.gimp_path is not None else None,  # type: ignore[arg-type]
+                noise_settings=options.pipeline.noise_settings,
+                unsharp_settings=options.pipeline.pre_unsharp_settings,
+                temp_dir=temp_dir,
+                prefix="comparison_pre",
+                controller=controller,
+            )
 
-            swinir_only_state, _, swinir_only_warning = _upscale_state(
+            swinir_only_state, swinir_only_scale, swinir_only_warning = _upscale_state(
                 state=original_state,
                 scale=options.pipeline.scale,
                 tile_size=options.pipeline.tile_size,
@@ -1222,48 +1355,143 @@ def run_comparison(
                 model_cache=model_cache,
                 controller=controller,
             )
-            gimp_pre_swinir_state, actual_scale, pre_swinir_warning = _upscale_state(
-                state=gimp_pre_state,
+            gimp_pre_swinir_state, gimp_pre_swinir_scale, gimp_pre_swinir_warning = _upscale_state(
+                state=gimp_only_state,
                 scale=options.pipeline.scale,
                 tile_size=options.pipeline.tile_size,
                 tile_overlap=options.pipeline.tile_overlap,
                 model_cache=model_cache,
                 controller=controller,
             )
-            gimp_pre_swinir_post_state = gimp_pre_swinir_state
-            if options.pipeline.use_gimp_post:
-                gimp_pre_swinir_post_state, gimp_post_log = _apply_gimp_stage(
-                    state=gimp_pre_swinir_state,
-                    gimp_path=Path(options.pipeline.gimp_path) if options.pipeline.gimp_path is not None else None,  # type: ignore[arg-type]
-                    noise_settings=NoiseReductionSettings(preset="off"),
-                    unsharp_settings=options.pipeline.post_unsharp_settings,
-                    temp_dir=temp_dir,
-                    prefix="comparison_post",
-                    controller=controller,
-                )
-            cutout_state = gimp_pre_swinir_post_state
+            gimp_pre_swinir_gimp_post_state, gimp_post_log = _apply_gimp_stage(
+                state=gimp_pre_swinir_state,
+                gimp_path=Path(options.pipeline.gimp_path) if options.pipeline.gimp_path is not None else None,  # type: ignore[arg-type]
+                noise_settings=NoiseReductionSettings(preset="off"),
+                unsharp_settings=options.pipeline.post_unsharp_settings,
+                temp_dir=temp_dir,
+                prefix="comparison_post",
+                controller=controller,
+            )
+
+            variant_rows: list[dict[str, Any]] = [
+                {
+                    "name": "original",
+                    "state": original_state,
+                    "actual_scale": "1.0000x1.0000",
+                    "warning_message": "",
+                    "processing_mode": PROCESSING_MODE_GIMP_ONLY,
+                    "swinir_used": False,
+                    "gimp_pre_used": False,
+                    "gimp_post_used": False,
+                    "cutout_used": False,
+                    "model_path": None,
+                    "gimp_pre_log": StageLog(),
+                    "gimp_post_log": StageLog(),
+                },
+                {
+                    "name": "gimp_only",
+                    "state": gimp_only_state,
+                    "actual_scale": "1.0000x1.0000",
+                    "warning_message": "",
+                    "processing_mode": PROCESSING_MODE_GIMP_ONLY,
+                    "swinir_used": False,
+                    "gimp_pre_used": True,
+                    "gimp_post_used": False,
+                    "cutout_used": False,
+                    "model_path": None,
+                    "gimp_pre_log": gimp_pre_log,
+                    "gimp_post_log": StageLog(),
+                },
+                {
+                    "name": "swinir_only",
+                    "state": swinir_only_state,
+                    "actual_scale": swinir_only_scale,
+                    "warning_message": swinir_only_warning,
+                    "processing_mode": PROCESSING_MODE_SWINIR_ONLY,
+                    "swinir_used": True,
+                    "gimp_pre_used": False,
+                    "gimp_post_used": False,
+                    "cutout_used": False,
+                    "model_path": model_path,
+                    "gimp_pre_log": StageLog(),
+                    "gimp_post_log": StageLog(),
+                },
+                {
+                    "name": "gimp_pre_swinir",
+                    "state": gimp_pre_swinir_state,
+                    "actual_scale": gimp_pre_swinir_scale,
+                    "warning_message": gimp_pre_swinir_warning,
+                    "processing_mode": PROCESSING_MODE_GIMP_PRE_SWINIR,
+                    "swinir_used": True,
+                    "gimp_pre_used": True,
+                    "gimp_post_used": False,
+                    "cutout_used": False,
+                    "model_path": model_path,
+                    "gimp_pre_log": gimp_pre_log,
+                    "gimp_post_log": StageLog(),
+                },
+                {
+                    "name": "gimp_pre_swinir_gimp_post",
+                    "state": gimp_pre_swinir_gimp_post_state,
+                    "actual_scale": gimp_pre_swinir_scale,
+                    "warning_message": gimp_pre_swinir_warning,
+                    "processing_mode": PROCESSING_MODE_GIMP_PRE_SWINIR_GIMP_POST,
+                    "swinir_used": True,
+                    "gimp_pre_used": True,
+                    "gimp_post_used": True,
+                    "cutout_used": False,
+                    "model_path": model_path,
+                    "gimp_pre_log": gimp_pre_log,
+                    "gimp_post_log": gimp_post_log,
+                },
+            ]
             if options.pipeline.use_cutout:
-                cutout_rgb, cutout_alpha = apply_person_cutout(cutout_state.rgb, cutout_state.alpha)
-                cutout_state = ImageState(cutout_rgb, cutout_alpha)
+                gimp_only_cutout_rgb, gimp_only_cutout_alpha = apply_person_cutout(
+                    gimp_only_state.rgb,
+                    gimp_only_state.alpha,
+                )
+                gimp_pre_swinir_cutout_rgb, gimp_pre_swinir_cutout_alpha = apply_person_cutout(
+                    gimp_pre_swinir_state.rgb,
+                    gimp_pre_swinir_state.alpha,
+                )
+                variant_rows.extend(
+                    [
+                        {
+                            "name": "gimp_only_cutout",
+                            "state": ImageState(gimp_only_cutout_rgb, gimp_only_cutout_alpha),
+                            "actual_scale": "1.0000x1.0000",
+                            "warning_message": "",
+                            "processing_mode": PROCESSING_MODE_GIMP_ONLY,
+                            "swinir_used": False,
+                            "gimp_pre_used": True,
+                            "gimp_post_used": False,
+                            "cutout_used": True,
+                            "model_path": None,
+                            "gimp_pre_log": gimp_pre_log,
+                            "gimp_post_log": StageLog(),
+                        },
+                        {
+                            "name": "gimp_pre_swinir_cutout",
+                            "state": ImageState(
+                                gimp_pre_swinir_cutout_rgb,
+                                gimp_pre_swinir_cutout_alpha,
+                            ),
+                            "actual_scale": gimp_pre_swinir_scale,
+                            "warning_message": gimp_pre_swinir_warning,
+                            "processing_mode": PROCESSING_MODE_GIMP_PRE_SWINIR,
+                            "swinir_used": True,
+                            "gimp_pre_used": True,
+                            "gimp_post_used": False,
+                            "cutout_used": True,
+                            "model_path": model_path,
+                            "gimp_pre_log": gimp_pre_log,
+                            "gimp_post_log": StageLog(),
+                        },
+                    ]
+                )
+            summary.total_files = len(variant_rows)
 
-            variant_states = {
-                "original": (original_state, "1.0000x1.0000", ""),
-                "gimp_pre": (gimp_pre_state, "1.0000x1.0000", ""),
-                "swinir_only": (swinir_only_state, actual_scale, swinir_only_warning),
-                "gimp_pre_swinir": (gimp_pre_swinir_state, actual_scale, pre_swinir_warning),
-                "gimp_pre_swinir_gimp_post": (
-                    gimp_pre_swinir_post_state,
-                    actual_scale,
-                    pre_swinir_warning,
-                ),
-                "gimp_pre_swinir_gimp_post_cutout": (
-                    cutout_state,
-                    actual_scale,
-                    pre_swinir_warning,
-                ),
-            }
-
-            for index, variant_name in enumerate(variant_specs, start=1):
+            for index, variant in enumerate(variant_rows, start=1):
                 controller.raise_if_cancelled()
                 if controller.should_stop():
                     summary.stopped = True
@@ -1274,35 +1502,45 @@ def run_comparison(
                     {
                         "phase": "started",
                         "completed": index - 1,
-                        "total": len(variant_specs),
-                        "path": f"{options.input_file.name} [{variant_name}]",
+                        "total": len(variant_rows),
+                        "path": f"{options.input_file.name} [{variant['name']}]",
                     }
                 )
                 processed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 started_at = time.perf_counter()
+                suffix = (
+                    f"_{variant['name']}_x{options.pipeline.scale}"
+                    if variant["swinir_used"]
+                    else f"_{variant['name']}"
+                )
                 output_path = build_flat_output_path(
                     input_path=options.input_file,
                     output_root=output_dir,
-                    suffix=f"_{variant_name}_x{options.pipeline.scale}",
+                    suffix=suffix,
                     collision_policy=options.collision_policy,
                     skip_existing=options.skip_existing,
                 )
                 if output_path is None:
                     row = make_log_row(
                         task_kind="comparison",
+                        processing_mode=variant["processing_mode"],
                         processed_at=processed_at,
                         input_path=options.input_file,
                         output_path=None,
                         original_size="",
                         processing_input_size="",
                         output_size="",
-                        requested_scale=options.pipeline.scale,
+                        requested_scale=options.pipeline.scale if variant["swinir_used"] else None,
                         actual_scale="",
-                        model_path=model_path,
+                        model_path=variant["model_path"],
                         pipeline=options.pipeline,
                         prepared=prepared,
-                        gimp_pre_log=gimp_pre_log,
-                        gimp_post_log=gimp_post_log,
+                        swinir_used=bool(variant["swinir_used"]),
+                        gimp_pre_used=bool(variant["gimp_pre_used"]),
+                        gimp_post_used=bool(variant["gimp_post_used"]),
+                        cutout_used=bool(variant["cutout_used"]),
+                        gimp_pre_log=variant["gimp_pre_log"],
+                        gimp_post_log=variant["gimp_post_log"],
                         result="skipped",
                         warning_message="",
                         error_message="同名の比較出力ファイルが既にあるためスキップしました。",
@@ -1314,20 +1552,23 @@ def run_comparison(
                         {
                             "phase": "finished",
                             "completed": index,
-                            "total": len(variant_specs),
-                            "path": f"{options.input_file.name} [{variant_name}]",
+                            "total": len(variant_rows),
+                            "path": f"{options.input_file.name} [{variant['name']}]",
                             "result": "skipped",
                         }
                     )
                     continue
 
                 try:
-                    state, variant_scale, warning_message = variant_states[variant_name]
+                    state = variant["state"]
+                    variant_scale = str(variant["actual_scale"])
+                    warning_message = str(variant["warning_message"])
                     _save_final_output(output_path, state)
                     output_height, output_width = state.rgb.shape[:2]
                     result_name = "processed_warning" if warning_message else "processed"
                     row = make_log_row(
                         task_kind="comparison",
+                        processing_mode=variant["processing_mode"],
                         processed_at=processed_at,
                         input_path=options.input_file,
                         output_path=output_path,
@@ -1336,13 +1577,17 @@ def run_comparison(
                             prepared.processing_width, prepared.processing_height
                         ),
                         output_size=format_size(output_width, output_height),
-                        requested_scale=options.pipeline.scale,
+                        requested_scale=options.pipeline.scale if variant["swinir_used"] else None,
                         actual_scale=variant_scale,
-                        model_path=model_path,
+                        model_path=variant["model_path"],
                         pipeline=options.pipeline,
                         prepared=prepared,
-                        gimp_pre_log=gimp_pre_log,
-                        gimp_post_log=gimp_post_log,
+                        swinir_used=bool(variant["swinir_used"]),
+                        gimp_pre_used=bool(variant["gimp_pre_used"]),
+                        gimp_post_used=bool(variant["gimp_post_used"]),
+                        cutout_used=bool(variant["cutout_used"]),
+                        gimp_pre_log=variant["gimp_pre_log"],
+                        gimp_post_log=variant["gimp_post_log"],
                         result=result_name,
                         warning_message=warning_message,
                         error_message="",
@@ -1352,13 +1597,13 @@ def run_comparison(
                     summary.processed += 1
                     if warning_message:
                         summary.warnings += 1
-                    message_callback(f"比較出力完了: {variant_name}")
+                    message_callback(f"比較出力完了: {variant['name']}")
                     progress_callback(
                         {
                             "phase": "finished",
                             "completed": index,
-                            "total": len(variant_specs),
-                            "path": f"{options.input_file.name} [{variant_name}]",
+                            "total": len(variant_rows),
+                            "path": f"{options.input_file.name} [{variant['name']}]",
                             "result": result_name,
                         }
                     )
@@ -1366,19 +1611,24 @@ def run_comparison(
                     failed_copy_path = copy_failed_file(options.input_file, options.input_file.parent, failed_root)
                     row = make_log_row(
                         task_kind="comparison",
+                        processing_mode=variant["processing_mode"],
                         processed_at=processed_at,
                         input_path=options.input_file,
                         output_path=output_path,
                         original_size="",
                         processing_input_size="",
                         output_size="",
-                        requested_scale=options.pipeline.scale,
+                        requested_scale=options.pipeline.scale if variant["swinir_used"] else None,
                         actual_scale="",
-                        model_path=model_path,
+                        model_path=variant["model_path"],
                         pipeline=options.pipeline,
                         prepared=prepared,
-                        gimp_pre_log=gimp_pre_log,
-                        gimp_post_log=gimp_post_log,
+                        swinir_used=bool(variant["swinir_used"]),
+                        gimp_pre_used=bool(variant["gimp_pre_used"]),
+                        gimp_post_used=bool(variant["gimp_post_used"]),
+                        cutout_used=bool(variant["cutout_used"]),
+                        gimp_pre_log=variant["gimp_pre_log"],
+                        gimp_post_log=variant["gimp_post_log"],
                         result="failed",
                         warning_message="",
                         error_message=f"{exc} | failed_copy={failed_copy_path}",
@@ -1387,13 +1637,13 @@ def run_comparison(
                     logger.log_processing(row)
                     logger.log_failed(row)
                     summary.failed += 1
-                    message_callback(f"比較出力失敗: {variant_name} -> {exc}")
+                    message_callback(f"比較出力失敗: {variant['name']} -> {exc}")
                     progress_callback(
                         {
                             "phase": "finished",
                             "completed": index,
-                            "total": len(variant_specs),
-                            "path": f"{options.input_file.name} [{variant_name}]",
+                            "total": len(variant_rows),
+                            "path": f"{options.input_file.name} [{variant['name']}]",
                             "result": "failed",
                         }
                     )
