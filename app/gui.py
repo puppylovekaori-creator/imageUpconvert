@@ -77,6 +77,13 @@ POST_UNSHARP_CHOICES = (
     ("強", "strong"),
 )
 PREVIEW_EXPORT_FILTER = "PNG画像 (*.png);;WEBP画像 (*.webp);;JPEG画像 (*.jpg *.jpeg)"
+PREVIEW_EXPORT_QUALITY_CHOICES = (
+    ("最高画質", "highest"),
+    ("高画質", "high"),
+    ("標準", "standard"),
+    ("軽量", "light"),
+    ("カスタム", "custom"),
+)
 
 
 class TaskWorker(QtCore.QThread):
@@ -161,6 +168,21 @@ class PreviewWindow(QtWidgets.QDialog):
         self._save_original_button.clicked.connect(self._save_original_item_via_dialog)
         self._save_comparison_button.clicked.connect(self._save_comparison_via_dialog)
 
+        self._export_quality_combo = QtWidgets.QComboBox()
+        for label, value in PREVIEW_EXPORT_QUALITY_CHOICES:
+            self._export_quality_combo.addItem(label, value)
+        self._export_quality_combo.setCurrentIndex(0)
+        self._export_quality_combo.currentIndexChanged.connect(self._update_export_quality_state)
+
+        self._export_custom_quality_spin = QtWidgets.QSpinBox()
+        self._export_custom_quality_spin.setRange(0, 100)
+        self._export_custom_quality_spin.setValue(100)
+        self._export_custom_quality_spin.valueChanged.connect(self._update_export_quality_state)
+
+        self._export_quality_note_label = QtWidgets.QLabel("")
+        self._export_quality_note_label.setWordWrap(True)
+        self._export_quality_note_label.setStyleSheet("color: #555555;")
+
         layout = QtWidgets.QVBoxLayout(self)
         header_row = QtWidgets.QHBoxLayout()
         header_row.addWidget(self._status_label, stretch=1)
@@ -168,6 +190,14 @@ class PreviewWindow(QtWidgets.QDialog):
         header_row.addWidget(self._save_original_button)
         header_row.addWidget(self._save_comparison_button)
         layout.addLayout(header_row)
+
+        export_row = QtWidgets.QHBoxLayout()
+        export_row.addWidget(QtWidgets.QLabel("保存画質"))
+        export_row.addWidget(self._export_quality_combo)
+        export_row.addWidget(QtWidgets.QLabel("カスタム値"))
+        export_row.addWidget(self._export_custom_quality_spin)
+        export_row.addWidget(self._export_quality_note_label, stretch=1)
+        layout.addLayout(export_row)
         layout.addWidget(self._save_status_label)
 
         content_row = QtWidgets.QHBoxLayout()
@@ -176,6 +206,7 @@ class PreviewWindow(QtWidgets.QDialog):
         layout.addLayout(content_row, stretch=1)
 
         self._update_export_buttons()
+        self._update_export_quality_state()
 
     def set_export_context(self, *, source_stem: str, default_dir: Path | None) -> None:
         stem = Path(source_stem).stem.strip() if source_stem else ""
@@ -288,6 +319,71 @@ class PreviewWindow(QtWidgets.QDialog):
         self._save_original_button.setEnabled(original_item is not None)
         self._save_comparison_button.setEnabled(has_items)
 
+    def export_settings(self) -> dict[str, int | str]:
+        return {
+            "preview_export_quality_preset": str(self._export_quality_combo.currentData() or "highest"),
+            "preview_export_custom_quality": int(self._export_custom_quality_spin.value()),
+        }
+
+    def apply_export_settings(self, data: dict[str, object]) -> None:
+        preset = str(data.get("preview_export_quality_preset", "highest") or "highest")
+        preset_index = self._export_quality_combo.findData(preset)
+        if preset_index >= 0:
+            self._export_quality_combo.setCurrentIndex(preset_index)
+        self._export_custom_quality_spin.setValue(int(data.get("preview_export_custom_quality", 100) or 100))
+        self._update_export_quality_state()
+
+    def _update_export_quality_state(self) -> None:
+        is_custom = str(self._export_quality_combo.currentData() or "highest") == "custom"
+        self._export_custom_quality_spin.setEnabled(is_custom)
+        self._export_quality_note_label.setText(self._export_quality_note())
+
+    def _export_quality_note(self) -> str:
+        preset = str(self._export_quality_combo.currentData() or "highest")
+        if preset == "highest":
+            return "JPEG / WEBP は最高画質、PNG は可逆のまま圧縮を弱くして保存します。"
+        if preset == "high":
+            return "JPEG / WEBP は高画質、PNG は可逆保存です。"
+        if preset == "standard":
+            return "標準は容量と見やすさの中間です。PNG は可逆のまま圧縮を少し強めます。"
+        if preset == "light":
+            return "軽量は容量優先です。JPEG / WEBP では劣化が出やすいので比較用向きです。"
+        return (
+            "カスタムは JPEG / WEBP の品質を 0-100 で指定します。"
+            " PNG は可逆のまま、その値に応じて圧縮率だけ変えます。"
+        )
+
+    def _export_quality_summary(self) -> str:
+        preset = str(self._export_quality_combo.currentData() or "highest")
+        label = self._export_quality_combo.currentText()
+        if preset == "custom":
+            return f"{label}({int(self._export_custom_quality_spin.value())})"
+        return label
+
+    def _resolved_export_quality(self) -> int:
+        preset = str(self._export_quality_combo.currentData() or "highest")
+        if preset == "highest":
+            return 100
+        if preset == "high":
+            return 95
+        if preset == "standard":
+            return 90
+        if preset == "light":
+            return 80
+        return int(self._export_custom_quality_spin.value())
+
+    def _resolved_png_compression(self) -> int:
+        quality = self._resolved_export_quality()
+        return max(0, min(9, round((100 - quality) / 11)))
+
+    def _format_from_suffix(self, suffix: str) -> bytes:
+        normalized = suffix.lower()
+        if normalized in {".jpg", ".jpeg"}:
+            return b"jpg"
+        if normalized == ".webp":
+            return b"webp"
+        return b"png"
+
     def _default_export_path(self, suffix: str) -> Path:
         base_dir = self._default_export_dir if str(self._default_export_dir).strip() else APP_ROOT / "comparison"
         return base_dir / f"{self._source_stem}_{suffix}.png"
@@ -323,7 +419,9 @@ class PreviewWindow(QtWidgets.QDialog):
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "保存エラー", str(exc))
             return
-        self._save_status_label.setText(f"表示中プレビューを保存しました: {saved_path}")
+        self._save_status_label.setText(
+            f"表示中プレビューを保存しました: {saved_path} / 画質: {self._export_quality_summary()}"
+        )
 
     def _save_original_item_via_dialog(self) -> None:
         original_item = self._find_item("original")
@@ -341,7 +439,9 @@ class PreviewWindow(QtWidgets.QDialog):
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "保存エラー", str(exc))
             return
-        self._save_status_label.setText(f"元画像プレビューを保存しました: {saved_path}")
+        self._save_status_label.setText(
+            f"元画像プレビューを保存しました: {saved_path} / 画質: {self._export_quality_summary()}"
+        )
 
     def _save_comparison_via_dialog(self) -> None:
         target_path = self._pick_export_path(
@@ -355,7 +455,9 @@ class PreviewWindow(QtWidgets.QDialog):
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "保存エラー", str(exc))
             return
-        self._save_status_label.setText(f"横並び比較画像を保存しました: {saved_path}")
+        self._save_status_label.setText(
+            f"横並び比較画像を保存しました: {saved_path} / 画質: {self._export_quality_summary()}"
+        )
 
     def _export_item_image(self, preview_item: PreviewItem, target_path: Path) -> Path:
         source_path = Path(preview_item.path)
@@ -367,16 +469,32 @@ class PreviewWindow(QtWidgets.QDialog):
         image = QtGui.QImage(str(source_path))
         if image.isNull():
             raise ValueError(f"プレビュー画像を読めませんでした: {source_path}")
-        if not image.save(str(target_path)):
-            raise ValueError(f"画像保存に失敗しました: {target_path}")
+        self._save_image_with_quality(image, target_path)
         return target_path
 
     def _export_comparison_image(self, target_path: Path) -> Path:
         comparison_image = self._build_comparison_image()
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        if not comparison_image.save(str(target_path)):
-            raise ValueError(f"横並び比較画像の保存に失敗しました: {target_path}")
+        self._save_image_with_quality(comparison_image, target_path)
         return target_path
+
+    def _save_image_with_quality(self, image: QtGui.QImage, target_path: Path) -> None:
+        writer = QtGui.QImageWriter(str(target_path), self._format_from_suffix(target_path.suffix))
+        writer.setOptimizedWrite(True)
+        writer.setQuality(self._resolved_export_quality())
+        writer.setCompression(self._resolved_png_compression())
+
+        output_image = image
+        if target_path.suffix.lower() in {".jpg", ".jpeg"} and image.hasAlphaChannel():
+            flattened = QtGui.QImage(image.size(), QtGui.QImage.Format.Format_RGB32)
+            flattened.fill(QtGui.QColor("#ffffff"))
+            painter = QtGui.QPainter(flattened)
+            painter.drawImage(0, 0, image)
+            painter.end()
+            output_image = flattened
+
+        if not writer.write(output_image):
+            raise ValueError(f"画像保存に失敗しました: {target_path} / {writer.errorString()}")
 
     def _build_comparison_image(self) -> QtGui.QImage:
         loaded_items: list[tuple[PreviewItem, QtGui.QImage]] = []
@@ -1275,6 +1393,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "post_unsharp_preset": str(self._post_unsharp_combo.currentData() or "off"),
             "use_cutout": self._use_cutout_checkbox.isChecked(),
         }
+        data.update(self._preview_window.export_settings())
         save_settings(data)
         self._append_log("設定を config.json に保存しました。")
 
@@ -1342,6 +1461,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if post_index >= 0:
             self._post_unsharp_combo.setCurrentIndex(post_index)
         self._use_cutout_checkbox.setChecked(bool(data.get("use_cutout", False)))
+        self._preview_window.apply_export_settings(data)
         self._update_mode_state()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # pragma: no cover - GUI behavior
