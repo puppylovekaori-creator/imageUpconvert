@@ -119,15 +119,103 @@ class TaskWorker(QtCore.QThread):
             self.error_signal.emit(str(exc))
 
 
+class PreviewWindow(QtWidgets.QDialog):
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("プレビュー")
+        self.resize(1180, 820)
+        self._current_path: str = ""
+        self._current_pixmap = QtGui.QPixmap()
+
+        self._status_label = QtWidgets.QLabel("プレビュー未生成")
+        self._status_label.setWordWrap(True)
+
+        self._list_widget = QtWidgets.QListWidget()
+        self._list_widget.setMinimumWidth(240)
+        self._list_widget.currentItemChanged.connect(self._handle_selection_changed)
+
+        self._image_label = QtWidgets.QLabel("画像未選択")
+        self._image_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self._image_label.setMinimumSize(720, 540)
+        self._image_label.setStyleSheet("border: 1px solid #c8c8c8; background: #fafafa;")
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(self._status_label)
+
+        content_row = QtWidgets.QHBoxLayout()
+        content_row.addWidget(self._list_widget)
+        content_row.addWidget(self._image_label, stretch=1)
+        layout.addLayout(content_row, stretch=1)
+
+    def set_preview_items(self, items: list[tuple[str, str]]) -> None:
+        self._list_widget.clear()
+        self._current_path = ""
+        self._current_pixmap = QtGui.QPixmap()
+        self._image_label.setText("画像未選択")
+        self._image_label.setPixmap(QtGui.QPixmap())
+
+        if not items:
+            self._status_label.setText("表示できるプレビュー画像がありません。")
+            return
+
+        self._status_label.setText(f"クリックで切り替えできます。候補数: {len(items)}")
+        for label, path_text in items:
+            item = QtWidgets.QListWidgetItem(label)
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, path_text)
+            self._list_widget.addItem(item)
+        self._list_widget.setCurrentRow(0)
+
+    def _handle_selection_changed(
+        self,
+        current: QtWidgets.QListWidgetItem | None,
+        previous: QtWidgets.QListWidgetItem | None,
+    ) -> None:
+        del previous
+        if current is None:
+            self._current_path = ""
+            self._current_pixmap = QtGui.QPixmap()
+            self._image_label.setText("画像未選択")
+            self._image_label.setPixmap(QtGui.QPixmap())
+            return
+
+        path_text = str(current.data(QtCore.Qt.ItemDataRole.UserRole) or "")
+        self._current_path = path_text
+        pixmap = QtGui.QPixmap(path_text)
+        if pixmap.isNull():
+            self._current_pixmap = QtGui.QPixmap()
+            self._image_label.setText("読込失敗")
+            self._image_label.setPixmap(QtGui.QPixmap())
+            return
+
+        self._current_pixmap = pixmap
+        self._render_current_pixmap()
+
+    def _render_current_pixmap(self) -> None:
+        if self._current_pixmap.isNull():
+            return
+        scaled = self._current_pixmap.scaled(
+            self._image_label.size(),
+            QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+            QtCore.Qt.TransformationMode.SmoothTransformation,
+        )
+        self._image_label.setPixmap(scaled)
+        self._image_label.setText("")
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # pragma: no cover - GUI behavior
+        super().resizeEvent(event)
+        if not self._current_pixmap.isNull():
+            self._render_current_pixmap()
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("GIMP / SwinIR 低侵襲人物画像処理 GUI")
-        self.resize(1380, 980)
+        self.resize(1040, 820)
         self._worker: TaskWorker | None = None
         self._available_scales = list_available_internal_scales()
-        self._preview_image_labels: dict[str, QtWidgets.QLabel] = {}
-        self._preview_caption_labels: dict[str, QtWidgets.QLabel] = {}
+        self._preview_window = PreviewWindow(self)
+        self._latest_preview_items: list[tuple[str, str]] = []
 
         self._gimp_path_edit = QtWidgets.QLineEdit()
         self._input_edit = QtWidgets.QLineEdit()
@@ -306,38 +394,17 @@ class MainWindow(QtWidgets.QMainWindow):
         preview_button.clicked.connect(self._pick_preview_file)
 
         path_form = QtWidgets.QGridLayout()
-        path_form.addWidget(QtWidgets.QLabel("GIMP 実行ファイル"), 0, 0)
-        path_form.addWidget(self._gimp_path_edit, 0, 1)
-        path_form.addWidget(gimp_button, 0, 2)
-        path_form.addWidget(QtWidgets.QLabel("入力フォルダ"), 1, 0)
-        path_form.addWidget(self._input_edit, 1, 1)
-        path_form.addWidget(input_button, 1, 2)
-        path_form.addWidget(QtWidgets.QLabel("出力フォルダ"), 2, 0)
-        path_form.addWidget(self._output_edit, 2, 1)
-        path_form.addWidget(output_button, 2, 2)
-        path_form.addWidget(QtWidgets.QLabel("プレビュー対象画像 / 比較用1枚"), 3, 0)
-        path_form.addWidget(self._preview_source_edit, 3, 1)
-        path_form.addWidget(preview_button, 3, 2)
-        path_form.addWidget(QtWidgets.QLabel("処理モード"), 4, 0)
-        path_form.addWidget(self._processing_mode_combo, 4, 1)
-        path_form.addWidget(QtWidgets.QLabel("倍率"), 5, 0)
-        path_form.addWidget(self._scale_combo, 5, 1)
-        path_form.addWidget(QtWidgets.QLabel("プレビュー範囲"), 6, 0)
-        path_form.addWidget(self._preview_range_combo, 6, 1)
-        path_form.addWidget(QtWidgets.QLabel("プレビュー crop 比率"), 7, 0)
-        path_form.addWidget(self._preview_ratio_combo, 7, 1)
-        path_form.addWidget(QtWidgets.QLabel("同名出力時"), 8, 0)
-        path_form.addWidget(self._collision_combo, 8, 1)
-        path_form.addWidget(QtWidgets.QLabel("tile size"), 9, 0)
-        path_form.addWidget(self._tile_size_spin, 9, 1)
-        path_form.addWidget(QtWidgets.QLabel("tile overlap"), 10, 0)
-        path_form.addWidget(self._tile_overlap_spin, 10, 1)
-        path_form.addWidget(QtWidgets.QLabel("CPU/GPU 状態"), 11, 0)
-        path_form.addWidget(self._device_label, 11, 1, 1, 2)
-        path_form.addWidget(QtWidgets.QLabel("GIMP 状態"), 12, 0)
-        path_form.addWidget(self._gimp_status_label, 12, 1, 1, 2)
-        path_form.addWidget(QtWidgets.QLabel("内部 SwinIR モデル"), 13, 0)
-        path_form.addWidget(self._model_info_label, 13, 1, 1, 2)
+        path_form.addWidget(QtWidgets.QLabel("入力フォルダ"), 0, 0)
+        path_form.addWidget(self._input_edit, 0, 1)
+        path_form.addWidget(input_button, 0, 2)
+        path_form.addWidget(QtWidgets.QLabel("出力フォルダ"), 1, 0)
+        path_form.addWidget(self._output_edit, 1, 1)
+        path_form.addWidget(output_button, 1, 2)
+        path_form.addWidget(QtWidgets.QLabel("プレビュー対象画像 / 比較用1枚"), 2, 0)
+        path_form.addWidget(self._preview_source_edit, 2, 1)
+        path_form.addWidget(preview_button, 2, 2)
+        path_form.addWidget(QtWidgets.QLabel("処理モード"), 3, 0)
+        path_form.addWidget(self._processing_mode_combo, 3, 1)
 
         pre_group = QtWidgets.QGroupBox("GIMP前処理")
         pre_layout = QtWidgets.QGridLayout(pre_group)
@@ -385,7 +452,6 @@ class MainWindow(QtWidgets.QMainWindow):
         toggle_row.addStretch(1)
 
         button_row = QtWidgets.QHBoxLayout()
-        button_row.addWidget(self._save_settings_button)
         button_row.addWidget(self._preview_button)
         button_row.addWidget(self._comparison_button)
         button_row.addWidget(self._test_button)
@@ -394,51 +460,83 @@ class MainWindow(QtWidgets.QMainWindow):
         button_row.addWidget(self._cancel_button)
         button_row.addStretch(1)
 
-        controls_widget = QtWidgets.QWidget()
-        controls_layout = QtWidgets.QVBoxLayout(controls_widget)
-        controls_layout.addWidget(intro_label)
-        controls_layout.addWidget(tips_label)
-        controls_layout.addWidget(warning_label)
-        controls_layout.addLayout(path_form)
-        controls_layout.addWidget(pre_group)
-        controls_layout.addWidget(post_group)
-        controls_layout.addLayout(toggle_row)
-        controls_layout.addLayout(button_row)
-        controls_layout.addWidget(self._preview_status_label)
-        controls_layout.addWidget(self._current_file_label)
-        controls_layout.addWidget(self._progress_bar)
-        controls_layout.addWidget(self._log_view, stretch=1)
+        run_tab = QtWidgets.QWidget()
+        run_layout = QtWidgets.QVBoxLayout(run_tab)
+        run_layout.addWidget(intro_label)
+        run_layout.addWidget(tips_label)
+        run_layout.addWidget(warning_label)
 
-        preview_group = QtWidgets.QGroupBox("プレビュー比較")
-        preview_grid = QtWidgets.QGridLayout(preview_group)
-        for index, (key, caption) in enumerate(
-            (
-                ("original", "元画像"),
-                ("gimp_pre", "GIMP前処理後"),
-                ("swinir", "SwinIR後"),
-                ("post", "SwinIR + GIMP後処理後"),
-            )
-        ):
-            caption_label = QtWidgets.QLabel(caption)
-            image_label = QtWidgets.QLabel("未生成")
-            image_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            image_label.setMinimumSize(320, 240)
-            image_label.setStyleSheet("border: 1px solid #c8c8c8; background: #fafafa;")
-            image_label.setScaledContents(False)
-            preview_grid.addWidget(caption_label, (index // 2) * 2, index % 2)
-            preview_grid.addWidget(image_label, (index // 2) * 2 + 1, index % 2)
-            self._preview_caption_labels[key] = caption_label
-            self._preview_image_labels[key] = image_label
+        source_group = QtWidgets.QGroupBox("実行対象")
+        source_layout = QtWidgets.QVBoxLayout(source_group)
+        source_layout.addLayout(path_form)
+        run_layout.addWidget(source_group)
 
-        splitter = QtWidgets.QSplitter()
-        splitter.addWidget(controls_widget)
-        splitter.addWidget(preview_group)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
+        execution_group = QtWidgets.QGroupBox("実行")
+        execution_layout = QtWidgets.QVBoxLayout(execution_group)
+        execution_layout.addLayout(toggle_row)
+        execution_layout.addLayout(button_row)
+        execution_layout.addWidget(self._preview_status_label)
+        execution_layout.addWidget(self._current_file_label)
+        execution_layout.addWidget(self._progress_bar)
+        run_layout.addWidget(execution_group)
+
+        log_group = QtWidgets.QGroupBox("ログ")
+        log_layout = QtWidgets.QVBoxLayout(log_group)
+        log_layout.addWidget(self._log_view)
+        run_layout.addWidget(log_group, stretch=1)
+
+        settings_tab = QtWidgets.QWidget()
+        settings_layout = QtWidgets.QVBoxLayout(settings_tab)
+
+        env_group = QtWidgets.QGroupBox("環境 / SwinIR")
+        env_layout = QtWidgets.QGridLayout(env_group)
+        env_layout.addWidget(QtWidgets.QLabel("GIMP 実行ファイル"), 0, 0)
+        env_layout.addWidget(self._gimp_path_edit, 0, 1)
+        env_layout.addWidget(gimp_button, 0, 2)
+        env_layout.addWidget(QtWidgets.QLabel("GIMP 状態"), 1, 0)
+        env_layout.addWidget(self._gimp_status_label, 1, 1, 1, 2)
+        env_layout.addWidget(QtWidgets.QLabel("CPU/GPU 状態"), 2, 0)
+        env_layout.addWidget(self._device_label, 2, 1, 1, 2)
+        env_layout.addWidget(QtWidgets.QLabel("内部 SwinIR モデル"), 3, 0)
+        env_layout.addWidget(self._model_info_label, 3, 1, 1, 2)
+        env_layout.addWidget(QtWidgets.QLabel("倍率"), 4, 0)
+        env_layout.addWidget(self._scale_combo, 4, 1)
+        env_layout.addWidget(QtWidgets.QLabel("同名出力時"), 5, 0)
+        env_layout.addWidget(self._collision_combo, 5, 1)
+        env_layout.addWidget(QtWidgets.QLabel("tile size"), 6, 0)
+        env_layout.addWidget(self._tile_size_spin, 6, 1)
+        env_layout.addWidget(QtWidgets.QLabel("tile overlap"), 7, 0)
+        env_layout.addWidget(self._tile_overlap_spin, 7, 1)
+        settings_layout.addWidget(env_group)
+
+        preview_group = QtWidgets.QGroupBox("プレビュー設定")
+        preview_layout = QtWidgets.QGridLayout(preview_group)
+        preview_layout.addWidget(QtWidgets.QLabel("プレビュー範囲"), 0, 0)
+        preview_layout.addWidget(self._preview_range_combo, 0, 1)
+        preview_layout.addWidget(QtWidgets.QLabel("プレビュー crop 比率"), 1, 0)
+        preview_layout.addWidget(self._preview_ratio_combo, 1, 1)
+        preview_note = QtWidgets.QLabel(
+            "プレビュー生成後は別ウィンドウで開きます。左側の一覧をクリックして表示を切り替えます。"
+        )
+        preview_note.setWordWrap(True)
+        preview_layout.addWidget(preview_note, 2, 0, 1, 2)
+        settings_layout.addWidget(preview_group)
+
+        settings_button_row = QtWidgets.QHBoxLayout()
+        settings_button_row.addWidget(self._save_settings_button)
+        settings_button_row.addStretch(1)
+        settings_layout.addLayout(settings_button_row)
+        settings_layout.addWidget(pre_group)
+        settings_layout.addWidget(post_group)
+        settings_layout.addStretch(1)
+
+        tabs = QtWidgets.QTabWidget()
+        tabs.addTab(run_tab, "実行")
+        tabs.addTab(settings_tab, "設定")
 
         central = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(central)
-        layout.addWidget(splitter, stretch=1)
+        layout.addWidget(tabs, stretch=1)
         self.setCentralWidget(central)
 
     def _connect_signals(self) -> None:
@@ -536,19 +634,19 @@ class MainWindow(QtWidgets.QMainWindow):
     def _selected_preview_range(self) -> str:
         return str(self._preview_range_combo.currentData() or "face_near")
 
-    def _refresh_preview_captions(self) -> None:
-        mode = self._selected_processing_mode()
-        self._preview_caption_labels["original"].setText("元画像")
-        if mode == PROCESSING_MODE_GIMP_ONLY:
-            self._preview_caption_labels["gimp_pre"].setText("GIMP処理後")
-            self._preview_caption_labels["swinir"].setText("未使用")
-        elif mode == PROCESSING_MODE_SWINIR_ONLY:
-            self._preview_caption_labels["gimp_pre"].setText("未使用")
-            self._preview_caption_labels["swinir"].setText("SwinIR後")
+    def _preview_label_map(self, mode: str | None = None) -> dict[str, str]:
+        target_mode = normalize_processing_mode(mode or self._selected_processing_mode())
+        labels = {"original": "元画像", "post": "最終出力"}
+        if target_mode == PROCESSING_MODE_GIMP_ONLY:
+            labels["gimp_pre"] = "GIMP処理後"
+            labels["swinir"] = "未使用"
+        elif target_mode == PROCESSING_MODE_SWINIR_ONLY:
+            labels["gimp_pre"] = "未使用"
+            labels["swinir"] = "SwinIR後"
         else:
-            self._preview_caption_labels["gimp_pre"].setText("GIMP前処理後")
-            self._preview_caption_labels["swinir"].setText("SwinIRのみ参考")
-        self._preview_caption_labels["post"].setText("最終出力")
+            labels["gimp_pre"] = "GIMP前処理後"
+            labels["swinir"] = "SwinIRのみ参考"
+        return labels
 
     def _update_mode_state(self) -> None:
         mode = self._selected_processing_mode()
@@ -565,7 +663,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._use_gimp_post_checkbox.setChecked(uses_gimp_post)
 
         self._refresh_model_info()
-        self._refresh_preview_captions()
         self._update_detail_visibility()
 
     def _build_noise_settings(self) -> NoiseReductionSettings:
@@ -817,11 +914,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_running_state(False)
         self._progress_bar.setValue(100)
         self._preview_status_label.setText(payload.get("message", "プレビュー生成完了"))
-        self._refresh_preview_captions()
-        self._load_preview_pixmap("original", payload.get("original_preview_path", ""))
-        self._load_preview_pixmap("gimp_pre", payload.get("gimp_pre_preview_path", ""))
-        self._load_preview_pixmap("swinir", payload.get("swinir_preview_path", ""))
-        self._load_preview_pixmap("post", payload.get("post_preview_path", ""))
+        labels = self._preview_label_map()
+        self._latest_preview_items = []
+        for key in ("original", "gimp_pre", "swinir", "post"):
+            path_text = str(payload.get(f"{key}_preview_path", "") or "")
+            if path_text:
+                self._latest_preview_items.append((labels.get(key, key), path_text))
+        self._preview_window.set_preview_items(self._latest_preview_items)
+        self._preview_window.show()
+        self._preview_window.raise_()
+        self._preview_window.activateWindow()
         self._append_log(payload.get("message", "プレビュー生成完了"))
         self._worker = None
 
@@ -866,25 +968,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._start_button.setEnabled(not is_running)
         self._stop_button.setEnabled(is_running)
         self._cancel_button.setEnabled(is_running)
-
-    def _load_preview_pixmap(self, key: str, path_text: str) -> None:
-        label = self._preview_image_labels[key]
-        if not path_text:
-            label.setText("未使用" if self._preview_caption_labels[key].text() == "未使用" else "未生成")
-            label.setPixmap(QtGui.QPixmap())
-            return
-        pixmap = QtGui.QPixmap(path_text)
-        if pixmap.isNull():
-            label.setText("読込失敗")
-            label.setPixmap(QtGui.QPixmap())
-            return
-        scaled = pixmap.scaled(
-            label.size(),
-            QtCore.Qt.AspectRatioMode.KeepAspectRatio,
-            QtCore.Qt.TransformationMode.SmoothTransformation,
-        )
-        label.setPixmap(scaled)
-        label.setText("")
 
     def _update_detail_visibility(self) -> None:
         mode = self._selected_processing_mode()
