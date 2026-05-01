@@ -18,6 +18,12 @@ from .swinir_runner import (
 APP_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MODEL_PATH = APP_ROOT / "models" / "swinir" / "001_classicalSR_DF2K_s64w8_SwinIR-M_x2.pth"
 DEFAULT_OUTPUT_DIR = APP_ROOT / "output"
+SUPPORTED_SCALE_ORDER = [2, 4]
+TASK_PRIORITY = {
+    "classical_sr": 0,
+    "lightweight_sr": 1,
+    "real_sr": 2,
+}
 
 
 class BatchWorker(QtCore.QThread):
@@ -67,14 +73,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle("SwinIR 画像高解像度化 GUI")
         self.resize(980, 720)
         self._worker: BatchWorker | None = None
+        self._available_models_by_scale: dict[int, list[Path]] = {}
+        self._preferred_model_by_scale: dict[int, Path] = {}
 
         self._input_edit = QtWidgets.QLineEdit()
         self._output_edit = QtWidgets.QLineEdit(str(DEFAULT_OUTPUT_DIR))
         self._model_edit = QtWidgets.QLineEdit(str(DEFAULT_MODEL_PATH))
+        self._model_edit.setReadOnly(True)
         self._scale_combo = QtWidgets.QComboBox()
-        self._scale_combo.addItem("2x", 2)
-        self._scale_combo.addItem("4x", 4)
-        self._scale_combo.setCurrentIndex(0)
 
         self._collision_combo = QtWidgets.QComboBox()
         self._collision_combo.addItem("スキップ", "skip")
@@ -115,7 +121,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_ui()
         self._connect_signals()
         self._refresh_runtime_status()
-        self._refresh_model_info()
+        self._rebuild_available_models(preferred_path=DEFAULT_MODEL_PATH, select_scale=2)
 
     def _build_ui(self) -> None:
         intro_label = QtWidgets.QLabel(
@@ -190,8 +196,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._test_button.clicked.connect(lambda: self._start_processing(test_mode=True))
         self._stop_button.clicked.connect(self._request_stop)
         self._cancel_button.clicked.connect(self._request_cancel)
-        self._model_edit.textChanged.connect(self._handle_model_path_changed)
-        self._scale_combo.currentIndexChanged.connect(self._refresh_model_info)
+        self._scale_combo.currentIndexChanged.connect(self._handle_scale_changed)
 
     def _append_log(self, message: str) -> None:
         self._log_view.appendPlainText(message)
@@ -211,38 +216,133 @@ class MainWindow(QtWidgets.QMainWindow):
             "PyTorch モデル (*.pth *.pt);;すべてのファイル (*.*)",
         )
         if file_path:
-            self._model_edit.setText(file_path)
+            selected_path = Path(file_path)
+            scale = detect_model_scale_from_filename(selected_path)
+            if scale not in SUPPORTED_SCALE_ORDER:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "モデルファイル",
+                    "公式 SwinIR の x2 または x4 モデルファイルを選択してください。",
+                )
+                return
+            try:
+                infer_model_descriptor(selected_path, scale)
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(self, "モデルファイル", str(exc))
+                return
+
+            self._rebuild_available_models(preferred_path=selected_path, select_scale=scale)
+            self._append_log(f"モデルフォルダを再読込しました: {selected_path.parent}")
 
     def _refresh_runtime_status(self) -> None:
         status = get_runtime_status()
         self._device_label.setText(format_runtime_status(status))
 
-    def _set_selected_scale(self, scale: int) -> None:
-        index = self._scale_combo.findData(scale)
-        if index < 0 or index == self._scale_combo.currentIndex():
-            return
-        blocker = QtCore.QSignalBlocker(self._scale_combo)
-        self._scale_combo.setCurrentIndex(index)
+    def _candidate_model_files(self, model_dir: Path) -> list[Path]:
+        candidates: list[Path] = []
+        for pattern in ("*.pth", "*.pt"):
+            candidates.extend(model_dir.glob(pattern))
+        return sorted({path.resolve() for path in candidates}, key=lambda path: path.name.lower())
+
+    def _model_sort_key(self, model_path: Path) -> tuple[int, int, str]:
+        scale = detect_model_scale_from_filename(model_path)
+        if scale not in SUPPORTED_SCALE_ORDER:
+            return (99, 99, model_path.name.lower())
+
+        descriptor = infer_model_descriptor(model_path, scale)
+        task_rank = TASK_PRIORITY.get(descriptor.task, 99)
+        large_rank = 1 if descriptor.large_model else 0
+        return (task_rank, large_rank, model_path.name.lower())
+
+    def _scan_available_models(self, model_dir: Path) -> dict[int, list[Path]]:
+        available: dict[int, list[Path]] = {scale: [] for scale in SUPPORTED_SCALE_ORDER}
+        for model_path in self._candidate_model_files(model_dir):
+            scale = detect_model_scale_from_filename(model_path)
+            if scale not in SUPPORTED_SCALE_ORDER:
+                continue
+            try:
+                infer_model_descriptor(model_path, scale)
+            except Exception:
+                continue
+            available[scale].append(model_path)
+
+        return {scale: sorted(paths, key=self._model_sort_key) for scale, paths in available.items() if paths}
+
+    def _choose_preferred_model(
+        self,
+        *,
+        scale: int,
+        candidates: list[Path],
+        preferred_path: Path | None,
+    ) -> Path:
+        if preferred_path is not None and preferred_path in candidates:
+            return preferred_path
+
+        current_preferred = self._preferred_model_by_scale.get(scale)
+        if current_preferred in candidates:
+            return current_preferred
+
+        return candidates[0]
+
+    def _set_model_path_text(self, model_path: Path) -> None:
+        blocker = QtCore.QSignalBlocker(self._model_edit)
+        self._model_edit.setText(str(model_path))
         del blocker
 
-    def _sync_scale_with_model_path(self, *, log_change: bool) -> bool:
-        model_text = self._model_edit.text().strip()
-        if not model_text:
-            return False
+    def _set_scale_choices(self, available_scales: list[int], selected_scale: int) -> None:
+        blocker = QtCore.QSignalBlocker(self._scale_combo)
+        self._scale_combo.clear()
+        for scale in available_scales:
+            self._scale_combo.addItem(f"{scale}x", scale)
+        index = self._scale_combo.findData(selected_scale)
+        if index >= 0:
+            self._scale_combo.setCurrentIndex(index)
+        del blocker
+        self._scale_combo.setEnabled(bool(available_scales))
 
-        detected_scale = detect_model_scale_from_filename(Path(model_text))
-        if detected_scale not in {2, 4}:
-            return False
-        if detected_scale == self._selected_scale():
-            return False
+    def _rebuild_available_models(self, *, preferred_path: Path | None, select_scale: int | None = None) -> None:
+        model_dir = preferred_path.parent if preferred_path is not None else DEFAULT_MODEL_PATH.parent
+        available_models = self._scan_available_models(model_dir)
 
-        self._set_selected_scale(detected_scale)
-        if log_change:
-            self._append_log(f"モデル名から倍率 x{detected_scale} を検出したため、倍率を自動調整しました。")
-        return True
+        if not available_models:
+            self._available_models_by_scale = {}
+            self._preferred_model_by_scale = {}
+            self._set_scale_choices([], selected_scale=2)
+            self._set_model_path_text(DEFAULT_MODEL_PATH)
+            self._model_info_label.setText(
+                f"モデルが見つかりません。{model_dir} に公式 SwinIR の x2/x4 モデルを置いてください。"
+            )
+            return
 
-    def _handle_model_path_changed(self) -> None:
-        self._sync_scale_with_model_path(log_change=False)
+        self._available_models_by_scale = available_models
+        self._preferred_model_by_scale = {
+            scale: self._choose_preferred_model(
+                scale=scale,
+                candidates=candidates,
+                preferred_path=preferred_path,
+            )
+            for scale, candidates in available_models.items()
+        }
+
+        available_scales = [scale for scale in SUPPORTED_SCALE_ORDER if scale in available_models]
+        target_scale = select_scale if select_scale in available_models else available_scales[0]
+        self._set_scale_choices(available_scales, selected_scale=target_scale)
+        self._update_model_path_for_selected_scale()
+        self._refresh_model_info()
+
+    def _update_model_path_for_selected_scale(self) -> None:
+        scale = self._selected_scale()
+        model_path = self._preferred_model_by_scale.get(scale)
+        if model_path is None:
+            self._set_model_path_text(DEFAULT_MODEL_PATH)
+            return
+        self._set_model_path_text(model_path)
+
+    def _handle_scale_changed(self) -> None:
+        if not self._available_models_by_scale:
+            self._refresh_model_info()
+            return
+        self._update_model_path_for_selected_scale()
         self._refresh_model_info()
 
     def _refresh_model_info(self) -> None:
@@ -250,12 +350,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if not model_text:
             self._model_info_label.setText("公式 SwinIR の .pth モデルを選択してください。")
             return
-
-        detected_scale = detect_model_scale_from_filename(Path(model_text))
-        if detected_scale in {2, 4} and detected_scale != self._selected_scale():
-            self._model_info_label.setText(
-                f"モデル名から x{detected_scale} を検出しました。開始時に倍率を x{detected_scale} へ自動調整します。"
-            )
+        if not self._available_models_by_scale:
+            self._model_info_label.setText("利用可能なモデルがありません。")
             return
 
         try:
@@ -280,7 +376,10 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _selected_scale(self) -> int:
-        return int(self._scale_combo.currentData())
+        current_data = self._scale_combo.currentData()
+        if current_data is None:
+            return 2
+        return int(current_data)
 
     def _build_options(self, *, test_mode: bool) -> BatchOptions:
         input_dir = Path(self._input_edit.text().strip())
@@ -314,9 +413,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 "入力フォルダ、出力フォルダ、モデルファイルはすべて必須です。",
             )
             return
-
-        self._sync_scale_with_model_path(log_change=True)
-        self._refresh_model_info()
+        if not self._available_models_by_scale:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "モデルファイル",
+                "利用可能なモデルがありません。models/swinir などに公式 SwinIR モデルを置いてください。",
+            )
+            return
 
         options = self._build_options(test_mode=test_mode)
         if not options.input_dir.exists():
