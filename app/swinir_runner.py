@@ -24,7 +24,16 @@ from .image_io import (
     save_png,
 )
 from .log_utils import CsvLogger
-from .sharpen_utils import apply_sharpen, is_sharpen_enabled, normalize_sharpen_strength
+from .sharpen_utils import (
+    apply_sharpen,
+    build_sharpen_suffix,
+    get_effective_sharpen_method,
+    get_sharpen_method_label,
+    is_sharpen_enabled,
+    list_sharpen_methods,
+    normalize_sharpen_method,
+    normalize_sharpen_strength,
+)
 
 try:
     import torch
@@ -38,7 +47,8 @@ else:
 VENDOR_NETWORK_PATH = (
     Path(__file__).resolve().parent.parent / "vendor" / "SwinIR" / "models" / "network_swinir.py"
 )
-DEFAULT_COMPARISON_SHARPEN_LEVELS = ("none", "weak", "medium")
+DEFAULT_COMPARISON_SHARPEN_METHODS = list_sharpen_methods()
+DEFAULT_COMPARISON_SHARPEN_STRENGTHS = ("none", "weak", "medium")
 
 
 class UserCancelledError(RuntimeError):
@@ -62,6 +72,7 @@ class BatchOptions:
     skip_existing: bool
     recursive: bool
     collision_policy: str
+    sharpen_method: str = "unsharp"
     sharpen_strength: str = "weak"
     crop_options: CropOptions = field(default_factory=CropOptions)
     test_mode: bool = False
@@ -77,8 +88,11 @@ class ComparisonOptions:
     tile_overlap: int
     skip_existing: bool
     collision_policy: str
-    sharpen_levels: tuple[str, ...] = DEFAULT_COMPARISON_SHARPEN_LEVELS
-    crop_options: CropOptions = field(default_factory=CropOptions)
+    sharpen_methods: tuple[str, ...] = DEFAULT_COMPARISON_SHARPEN_METHODS
+    sharpen_strengths: tuple[str, ...] = DEFAULT_COMPARISON_SHARPEN_STRENGTHS
+    include_full_image: bool = True
+    include_crop_image: bool = True
+    crop_ratio: str = "4:5"
 
 
 @dataclass(slots=True)
@@ -121,6 +135,8 @@ class VariantPlan:
     label: str
     model_path: Path
     scale: int
+    crop_options: CropOptions
+    sharpen_method: str
     sharpen_strength: str
     suffix: str
 
@@ -330,6 +346,7 @@ def validate_options(options: BatchOptions) -> None:
             "出力フォルダは入力フォルダと別にしてください。入力フォルダの内側も指定できません。"
         )
 
+    normalize_sharpen_method(options.sharpen_method)
     normalize_sharpen_strength(options.sharpen_strength)
     if options.crop_options.enabled:
         parse_ratio_text(options.crop_options.ratio)
@@ -350,10 +367,14 @@ def validate_comparison_options(options: ComparisonOptions) -> None:
         if not model_path.exists() or not model_path.is_file():
             raise ValueError(f"x{scale} 用モデルファイルが存在しません。")
         infer_model_descriptor(model_path, scale)
-    for sharpen_level in options.sharpen_levels:
-        normalize_sharpen_strength(sharpen_level)
-    if options.crop_options.enabled:
-        parse_ratio_text(options.crop_options.ratio)
+    if not options.include_full_image and not options.include_crop_image:
+        raise ValueError("比較処理では、全体版または crop 版の少なくともどちらかを有効にしてください。")
+    for sharpen_method in options.sharpen_methods:
+        normalize_sharpen_method(sharpen_method)
+    for sharpen_strength in options.sharpen_strengths:
+        normalize_sharpen_strength(sharpen_strength)
+    if options.include_crop_image:
+        parse_ratio_text(options.crop_ratio)
 
 
 def get_effective_output_dir(options: BatchOptions) -> Path:
@@ -475,6 +496,7 @@ def make_log_row(
     crop_enabled: str,
     crop_range: str,
     sharpen_enabled: str,
+    sharpen_method: str,
     sharpen_strength: str,
     result: str,
     warning_message: str,
@@ -497,6 +519,7 @@ def make_log_row(
         "crop_enabled": crop_enabled,
         "crop_range": crop_range,
         "sharpen_enabled": sharpen_enabled,
+        "sharpen_method": sharpen_method,
         "sharpen_strength": sharpen_strength,
         "processing_result": result,
         "warning_message": warning_message,
@@ -509,16 +532,13 @@ def build_output_suffix(
     *,
     scale: int,
     crop_enabled: bool,
+    sharpen_method: str,
     sharpen_strength: str,
-    include_sharpen_none: bool = False,
 ) -> str:
-    normalized_sharpen = normalize_sharpen_strength(sharpen_strength)
     suffix = f"_swinir_x{scale}"
     if crop_enabled:
         suffix += "_crop"
-    if normalized_sharpen != "none" or include_sharpen_none:
-        suffix += f"_sharp_{normalized_sharpen}"
-    return suffix
+    return suffix + build_sharpen_suffix(sharpen_method, sharpen_strength)
 
 
 def format_size(width: int, height: int) -> str:
@@ -597,7 +617,7 @@ def execute_variant(
         tile_overlap=tile_overlap,
         controller=controller,
     )
-    output_rgb = apply_sharpen(output_rgb, plan.sharpen_strength)
+    output_rgb = apply_sharpen(output_rgb, plan.sharpen_method, plan.sharpen_strength)
     output_alpha = resize_alpha(prepared_image.alpha, plan.scale) if prepared_image.alpha is not None else None
 
     actual_height, actual_width = output_rgb.shape[:2]
@@ -660,7 +680,10 @@ def run_batch(
             else "OFF"
         )
     )
-    message_callback(f"シャープ処理: {normalize_sharpen_strength(options.sharpen_strength)}")
+    message_callback(
+        "シャープ処理: "
+        f"{get_sharpen_method_label(options.sharpen_method)} / {normalize_sharpen_strength(options.sharpen_strength)}"
+    )
 
     summary = RunSummary(
         total_files=len(files),
@@ -675,15 +698,21 @@ def run_batch(
     logger = CsvLogger(output_dir)
     model_cache = ModelRuntimeCache(device, message_callback)
     plan = VariantPlan(
-        label=f"x{options.scale} / sharp {normalize_sharpen_strength(options.sharpen_strength)}",
+        label=(
+            f"x{options.scale} / "
+            f"{get_sharpen_method_label(options.sharpen_method)} / "
+            f"{normalize_sharpen_strength(options.sharpen_strength)}"
+        ),
         model_path=options.model_path,
         scale=options.scale,
+        crop_options=options.crop_options,
+        sharpen_method=options.sharpen_method,
         sharpen_strength=normalize_sharpen_strength(options.sharpen_strength),
         suffix=build_output_suffix(
             scale=options.scale,
             crop_enabled=options.crop_options.enabled,
+            sharpen_method=options.sharpen_method,
             sharpen_strength=options.sharpen_strength,
-            include_sharpen_none=False,
         ),
     )
 
@@ -731,7 +760,8 @@ def run_batch(
                     alpha_present="",
                     crop_enabled="yes" if options.crop_options.enabled else "no",
                     crop_range=options.crop_options.ratio if options.crop_options.enabled else "",
-                    sharpen_enabled="yes" if is_sharpen_enabled(options.sharpen_strength) else "no",
+                    sharpen_enabled="yes" if is_sharpen_enabled(options.sharpen_method, options.sharpen_strength) else "no",
+                    sharpen_method=get_effective_sharpen_method(options.sharpen_method, options.sharpen_strength),
                     sharpen_strength=normalize_sharpen_strength(options.sharpen_strength),
                     result="skipped",
                     warning_message="",
@@ -778,7 +808,8 @@ def run_batch(
                     alpha_present=prepared.alpha_present,
                     crop_enabled=prepared.crop_enabled,
                     crop_range=prepared.crop_range,
-                    sharpen_enabled="yes" if is_sharpen_enabled(options.sharpen_strength) else "no",
+                    sharpen_enabled="yes" if is_sharpen_enabled(options.sharpen_method, options.sharpen_strength) else "no",
+                    sharpen_method=get_effective_sharpen_method(options.sharpen_method, options.sharpen_strength),
                     sharpen_strength=normalize_sharpen_strength(options.sharpen_strength),
                     result=result,
                     warning_message=warning_message,
@@ -820,7 +851,8 @@ def run_batch(
                     alpha_present="",
                     crop_enabled="yes" if options.crop_options.enabled else "no",
                     crop_range=options.crop_options.ratio if options.crop_options.enabled else "",
-                    sharpen_enabled="yes" if is_sharpen_enabled(options.sharpen_strength) else "no",
+                    sharpen_enabled="yes" if is_sharpen_enabled(options.sharpen_method, options.sharpen_strength) else "no",
+                    sharpen_method=get_effective_sharpen_method(options.sharpen_method, options.sharpen_strength),
                     sharpen_strength=normalize_sharpen_strength(options.sharpen_strength),
                     result="failed",
                     warning_message="",
@@ -849,26 +881,65 @@ def run_batch(
     return summary
 
 
-def build_comparison_plans(options: ComparisonOptions) -> list[VariantPlan]:
-    plans: list[VariantPlan] = []
-    for scale in (2, 4):
-        model_path = options.model_paths_by_scale[scale]
-        for sharpen_strength in options.sharpen_levels:
-            normalized_sharpen = normalize_sharpen_strength(sharpen_strength)
-            plans.append(
-                VariantPlan(
-                    label=f"x{scale} / sharp {normalized_sharpen}",
-                    model_path=model_path,
-                    scale=scale,
-                    sharpen_strength=normalized_sharpen,
-                    suffix=build_output_suffix(
-                        scale=scale,
-                        crop_enabled=options.crop_options.enabled,
-                        sharpen_strength=normalized_sharpen,
-                        include_sharpen_none=True,
-                    ),
+def build_comparison_sharpen_variants(
+    options: ComparisonOptions,
+) -> list[tuple[str, str, str]]:
+    variants: list[tuple[str, str, str]] = []
+    normalized_methods = [normalize_sharpen_method(method) for method in options.sharpen_methods]
+    normalized_strengths = [normalize_sharpen_strength(strength) for strength in options.sharpen_strengths]
+
+    if "none" in normalized_strengths:
+        variants.append(("unsharp", "none", "シャープなし"))
+
+    for method in normalized_methods:
+        for strength in normalized_strengths:
+            if strength == "none":
+                continue
+            variants.append(
+                (
+                    method,
+                    strength,
+                    f"{get_sharpen_method_label(method)} / {strength}",
                 )
             )
+    return variants
+
+
+def build_comparison_crop_variants(
+    options: ComparisonOptions,
+) -> list[tuple[str, CropOptions]]:
+    variants: list[tuple[str, CropOptions]] = []
+    if options.include_full_image:
+        variants.append(("全体", CropOptions(enabled=False, ratio=options.crop_ratio)))
+    if options.include_crop_image:
+        variants.append(("crop", CropOptions(enabled=True, ratio=options.crop_ratio)))
+    return variants
+
+
+def build_comparison_plans(options: ComparisonOptions) -> list[VariantPlan]:
+    plans: list[VariantPlan] = []
+    sharpen_variants = build_comparison_sharpen_variants(options)
+    crop_variants = build_comparison_crop_variants(options)
+    for scope_label, crop_options in crop_variants:
+        for scale in (2, 4):
+            model_path = options.model_paths_by_scale[scale]
+            for sharpen_method, sharpen_strength, sharpen_label in sharpen_variants:
+                plans.append(
+                    VariantPlan(
+                        label=f"{scope_label} / x{scale} / {sharpen_label}",
+                        model_path=model_path,
+                        scale=scale,
+                        crop_options=crop_options,
+                        sharpen_method=sharpen_method,
+                        sharpen_strength=sharpen_strength,
+                        suffix=build_output_suffix(
+                            scale=scale,
+                            crop_enabled=crop_options.enabled,
+                            sharpen_method=sharpen_method,
+                            sharpen_strength=sharpen_strength,
+                        ),
+                    )
+                )
     return plans
 
 
@@ -895,17 +966,23 @@ def run_comparison(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger = CsvLogger(output_dir)
     model_cache = ModelRuntimeCache(device, message_callback)
+    prepared_cache: dict[tuple[bool, str], PreparedImage] = {}
 
     message_callback(f"比較出力先: {output_dir}")
     message_callback(f"比較対象: {options.input_file}")
     message_callback(f"使用デバイス: {device}")
     message_callback(
-        "crop: "
-        + (
-            f"ON ({options.crop_options.ratio})"
-            if options.crop_options.enabled
-            else "OFF"
-        )
+        "比較バリエーション: "
+        f"全体={'ON' if options.include_full_image else 'OFF'} / "
+        f"crop={'ON' if options.include_crop_image else 'OFF'} ({options.crop_ratio})"
+    )
+    message_callback(
+        "比較シャープ方式: "
+        + ", ".join(get_sharpen_method_label(method) for method in options.sharpen_methods)
+    )
+    message_callback(
+        "比較シャープ強度: "
+        + ", ".join(normalize_sharpen_strength(strength) for strength in options.sharpen_strengths)
     )
 
     summary = RunSummary(
@@ -960,9 +1037,10 @@ def run_comparison(
                     tile_size=options.tile_size,
                     tile_overlap=options.tile_overlap,
                     alpha_present="",
-                    crop_enabled="yes" if options.crop_options.enabled else "no",
-                    crop_range=options.crop_options.ratio if options.crop_options.enabled else "",
-                    sharpen_enabled="yes" if is_sharpen_enabled(plan.sharpen_strength) else "no",
+                    crop_enabled="yes" if plan.crop_options.enabled else "no",
+                    crop_range=plan.crop_options.ratio if plan.crop_options.enabled else "",
+                    sharpen_enabled="yes" if is_sharpen_enabled(plan.sharpen_method, plan.sharpen_strength) else "no",
+                    sharpen_method=get_effective_sharpen_method(plan.sharpen_method, plan.sharpen_strength),
                     sharpen_strength=plan.sharpen_strength,
                     result="skipped",
                     warning_message="",
@@ -983,7 +1061,10 @@ def run_comparison(
                 continue
 
             try:
-                prepared = prepare_image(options.input_file, options.crop_options)
+                prepared_key = (plan.crop_options.enabled, plan.crop_options.ratio)
+                if prepared_key not in prepared_cache:
+                    prepared_cache[prepared_key] = prepare_image(options.input_file, plan.crop_options)
+                prepared = prepared_cache[prepared_key]
                 output_size, actual_scale, warning_message = execute_variant(
                     prepared_image=prepared,
                     plan=plan,
@@ -1009,7 +1090,8 @@ def run_comparison(
                     alpha_present=prepared.alpha_present,
                     crop_enabled=prepared.crop_enabled,
                     crop_range=prepared.crop_range,
-                    sharpen_enabled="yes" if is_sharpen_enabled(plan.sharpen_strength) else "no",
+                    sharpen_enabled="yes" if is_sharpen_enabled(plan.sharpen_method, plan.sharpen_strength) else "no",
+                    sharpen_method=get_effective_sharpen_method(plan.sharpen_method, plan.sharpen_strength),
                     sharpen_strength=plan.sharpen_strength,
                     result=result,
                     warning_message=warning_message,
@@ -1049,9 +1131,10 @@ def run_comparison(
                     tile_size=options.tile_size,
                     tile_overlap=options.tile_overlap,
                     alpha_present="",
-                    crop_enabled="yes" if options.crop_options.enabled else "no",
-                    crop_range=options.crop_options.ratio if options.crop_options.enabled else "",
-                    sharpen_enabled="yes" if is_sharpen_enabled(plan.sharpen_strength) else "no",
+                    crop_enabled="yes" if plan.crop_options.enabled else "no",
+                    crop_range=plan.crop_options.ratio if plan.crop_options.enabled else "",
+                    sharpen_enabled="yes" if is_sharpen_enabled(plan.sharpen_method, plan.sharpen_strength) else "no",
+                    sharpen_method=get_effective_sharpen_method(plan.sharpen_method, plan.sharpen_strength),
                     sharpen_strength=plan.sharpen_strength,
                     result="failed",
                     warning_message="",
@@ -1091,6 +1174,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--recursive", action="store_true")
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--collision-policy", choices=["skip", "serial"], default="skip")
+    parser.add_argument(
+        "--sharpen-method",
+        choices=list_sharpen_methods(),
+        default="unsharp",
+    )
     parser.add_argument("--sharpen", choices=["none", "weak", "medium", "strong"], default="weak")
     parser.add_argument("--enable-crop", action="store_true")
     parser.add_argument("--crop-ratio", default="4:5")
@@ -1111,6 +1199,7 @@ def main() -> int:
         skip_existing=args.skip_existing,
         recursive=args.recursive,
         collision_policy=args.collision_policy,
+        sharpen_method=args.sharpen_method,
         sharpen_strength=args.sharpen,
         crop_options=CropOptions(enabled=args.enable_crop, ratio=args.crop_ratio),
         test_mode=args.test_mode,

@@ -20,6 +20,7 @@ PROCESSING_HEADERS = [
     "crop_enabled",
     "crop_range",
     "sharpen_enabled",
+    "sharpen_method",
     "sharpen_strength",
     "processing_result",
     "warning_message",

@@ -7,6 +7,12 @@ from pathlib import Path
 from PySide6 import QtCore, QtWidgets
 
 from .env_check import format_runtime_status, get_runtime_status
+from .sharpen_utils import (
+    get_sharpen_method_label_ja,
+    get_sharpen_strength_label_ja,
+    list_sharpen_methods,
+    list_sharpen_strengths,
+)
 from .swinir_runner import (
     BatchOptions,
     ComparisonOptions,
@@ -30,6 +36,12 @@ TASK_PRIORITY = {
 }
 CROP_RATIO_CHOICES = ["1:1", "4:5", "3:4", "2:3", "16:9", "9:16"]
 SUPPORTED_FILE_FILTER = "画像 (*.jpg *.jpeg *.png *.webp);;すべてのファイル (*.*)"
+DEFAULT_COMPARISON_STRENGTHS = {
+    "none": True,
+    "weak": True,
+    "medium": True,
+    "strong": False,
+}
 
 
 class TaskWorker(QtCore.QThread):
@@ -76,10 +88,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("SwinIR 画像高解像度化 GUI")
-        self.resize(1040, 820)
+        self.resize(1120, 920)
         self._worker: TaskWorker | None = None
         self._available_models_by_scale: dict[int, list[Path]] = {}
         self._preferred_model_by_scale: dict[int, Path] = {}
+        self._comparison_method_checks: dict[str, QtWidgets.QCheckBox] = {}
+        self._comparison_strength_checks: dict[str, QtWidgets.QCheckBox] = {}
 
         self._input_edit = QtWidgets.QLineEdit()
         self._output_edit = QtWidgets.QLineEdit(str(DEFAULT_OUTPUT_DIR))
@@ -92,19 +106,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self._collision_combo.addItem("スキップ", "skip")
         self._collision_combo.addItem("連番で保存", "serial")
 
-        self._sharpen_combo = QtWidgets.QComboBox()
-        self._sharpen_combo.addItem("なし", "none")
-        self._sharpen_combo.addItem("弱", "weak")
-        self._sharpen_combo.addItem("中", "medium")
-        self._sharpen_combo.addItem("強", "strong")
-        self._sharpen_combo.setCurrentIndex(1)
+        self._sharpen_method_combo = QtWidgets.QComboBox()
+        for method in list_sharpen_methods():
+            self._sharpen_method_combo.addItem(get_sharpen_method_label_ja(method), method)
 
-        self._crop_enabled_checkbox = QtWidgets.QCheckBox("中央cropを有効にする")
+        self._sharpen_strength_combo = QtWidgets.QComboBox()
+        for strength in list_sharpen_strengths():
+            self._sharpen_strength_combo.addItem(get_sharpen_strength_label_ja(strength), strength)
+        self._sharpen_strength_combo.setCurrentIndex(1)
+
+        self._batch_crop_enabled_checkbox = QtWidgets.QCheckBox("通常処理で中央cropを有効にする")
         self._crop_ratio_combo = QtWidgets.QComboBox()
         for ratio_text in CROP_RATIO_CHOICES:
             self._crop_ratio_combo.addItem(ratio_text, ratio_text)
         self._crop_ratio_combo.setCurrentText("4:5")
-        self._crop_ratio_combo.setEnabled(False)
+
+        self._comparison_include_full_checkbox = QtWidgets.QCheckBox("比較で全体版を出力")
+        self._comparison_include_full_checkbox.setChecked(True)
+        self._comparison_include_crop_checkbox = QtWidgets.QCheckBox("比較でcrop版も出力")
+        self._comparison_include_crop_checkbox.setChecked(True)
 
         self._skip_checkbox = QtWidgets.QCheckBox("既に出力済みのファイルはスキップする")
         self._skip_checkbox.setChecked(True)
@@ -142,7 +162,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._log_view = QtWidgets.QPlainTextEdit()
         self._log_view.setReadOnly(True)
-        self._log_view.setMaximumBlockCount(2000)
+        self._log_view.setMaximumBlockCount(2500)
 
         self._start_button = QtWidgets.QPushButton("一括処理開始")
         self._test_button = QtWidgets.QPushButton("テスト処理（先頭5枚）")
@@ -165,8 +185,8 @@ class MainWindow(QtWidgets.QMainWindow):
         intro_label.setWordWrap(True)
 
         tips_label = QtWidgets.QLabel(
-            "最初は classical_sr の 2x、シャープ弱、PNG 出力、tile size 400、tile overlap 32、"
-            "出力済みスキップ ON、サブフォルダ OFF を推奨します。大量処理前に必ずテスト処理か 1枚比較処理で確認してください。"
+            "最初は classical_sr の 2x、Unsharp Mask の弱、PNG 出力、tile size 400、tile overlap 32 を推奨します。"
+            " 大量処理前に必ずテスト処理か 1枚比較処理で確認してください。"
         )
         tips_label.setWordWrap(True)
 
@@ -201,14 +221,51 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addWidget(self._tile_size_spin, 6, 1)
         form.addWidget(QtWidgets.QLabel("tile overlap"), 7, 0)
         form.addWidget(self._tile_overlap_spin, 7, 1)
-        form.addWidget(QtWidgets.QLabel("シャープ処理"), 8, 0)
-        form.addWidget(self._sharpen_combo, 8, 1)
-        form.addWidget(self._crop_enabled_checkbox, 9, 0)
-        form.addWidget(self._crop_ratio_combo, 9, 1)
-        form.addWidget(QtWidgets.QLabel("CPU/GPU 状態"), 10, 0)
-        form.addWidget(self._device_label, 10, 1, 1, 2)
-        form.addWidget(QtWidgets.QLabel("判定モデル"), 11, 0)
-        form.addWidget(self._model_info_label, 11, 1, 1, 2)
+        form.addWidget(QtWidgets.QLabel("通常処理のシャープ方式"), 8, 0)
+        form.addWidget(self._sharpen_method_combo, 8, 1)
+        form.addWidget(QtWidgets.QLabel("通常処理のシャープ強度"), 9, 0)
+        form.addWidget(self._sharpen_strength_combo, 9, 1)
+        form.addWidget(self._batch_crop_enabled_checkbox, 10, 0)
+        form.addWidget(QtWidgets.QLabel("crop 比率（通常処理 / 比較で共通）"), 10, 1)
+        form.addWidget(self._crop_ratio_combo, 10, 2)
+        form.addWidget(QtWidgets.QLabel("CPU/GPU 状態"), 11, 0)
+        form.addWidget(self._device_label, 11, 1, 1, 2)
+        form.addWidget(QtWidgets.QLabel("判定モデル"), 12, 0)
+        form.addWidget(self._model_info_label, 12, 1, 1, 2)
+
+        comparison_group = QtWidgets.QGroupBox("1枚比較処理の条件")
+        comparison_layout = QtWidgets.QVBoxLayout(comparison_group)
+
+        compare_target_row = QtWidgets.QHBoxLayout()
+        compare_target_row.addWidget(self._comparison_include_full_checkbox)
+        compare_target_row.addWidget(self._comparison_include_crop_checkbox)
+        compare_target_row.addStretch(1)
+        comparison_layout.addLayout(compare_target_row)
+
+        method_group = QtWidgets.QGroupBox("比較するシャープ方式")
+        method_layout = QtWidgets.QGridLayout(method_group)
+        for index, method in enumerate(list_sharpen_methods()):
+            checkbox = QtWidgets.QCheckBox(get_sharpen_method_label_ja(method))
+            checkbox.setChecked(True)
+            self._comparison_method_checks[method] = checkbox
+            method_layout.addWidget(checkbox, index // 2, index % 2)
+        comparison_layout.addWidget(method_group)
+
+        strength_group = QtWidgets.QGroupBox("比較するシャープ強度")
+        strength_layout = QtWidgets.QGridLayout(strength_group)
+        for index, strength in enumerate(list_sharpen_strengths()):
+            checkbox = QtWidgets.QCheckBox(get_sharpen_strength_label_ja(strength))
+            checkbox.setChecked(DEFAULT_COMPARISON_STRENGTHS.get(strength, False))
+            self._comparison_strength_checks[strength] = checkbox
+            strength_layout.addWidget(checkbox, 0, index)
+        comparison_layout.addWidget(strength_group)
+
+        comparison_note = QtWidgets.QLabel(
+            "1枚比較処理では、全体/crop、x2/x4、選択したシャープ方式、選択した強度を組み合わせて comparison フォルダへ出力します。"
+            " 強を増やすと出力数と処理時間が増えます。"
+        )
+        comparison_note.setWordWrap(True)
+        comparison_layout.addWidget(comparison_note)
 
         checkbox_row = QtWidgets.QHBoxLayout()
         checkbox_row.addWidget(self._skip_checkbox)
@@ -228,6 +285,7 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(intro_label)
         layout.addWidget(tips_label)
         layout.addLayout(form)
+        layout.addWidget(comparison_group)
         layout.addLayout(checkbox_row)
         layout.addLayout(button_row)
         layout.addWidget(self._current_file_label)
@@ -242,7 +300,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stop_button.clicked.connect(self._request_stop)
         self._cancel_button.clicked.connect(self._request_cancel)
         self._scale_combo.currentIndexChanged.connect(self._handle_scale_changed)
-        self._crop_enabled_checkbox.toggled.connect(self._crop_ratio_combo.setEnabled)
 
     def _append_log(self, message: str) -> None:
         self._log_view.appendPlainText(message)
@@ -441,11 +498,34 @@ class MainWindow(QtWidgets.QMainWindow):
             return 2
         return int(current_data)
 
-    def _build_crop_options(self) -> CropOptions:
+    def _build_batch_crop_options(self) -> CropOptions:
         return CropOptions(
-            enabled=self._crop_enabled_checkbox.isChecked(),
+            enabled=self._batch_crop_enabled_checkbox.isChecked(),
             ratio=str(self._crop_ratio_combo.currentData() or self._crop_ratio_combo.currentText()),
         )
+
+    def _selected_comparison_methods(self) -> tuple[str, ...]:
+        return tuple(
+            method
+            for method, checkbox in self._comparison_method_checks.items()
+            if checkbox.isChecked()
+        )
+
+    def _selected_comparison_strengths(self) -> tuple[str, ...]:
+        return tuple(
+            strength
+            for strength, checkbox in self._comparison_strength_checks.items()
+            if checkbox.isChecked()
+        )
+
+    def _estimate_comparison_variant_count(self) -> int:
+        strengths = self._selected_comparison_strengths()
+        methods = self._selected_comparison_methods()
+        per_scope = (1 if "none" in strengths else 0) + (len(methods) * len([s for s in strengths if s != "none"]))
+        scope_count = int(self._comparison_include_full_checkbox.isChecked()) + int(
+            self._comparison_include_crop_checkbox.isChecked()
+        )
+        return per_scope * 2 * scope_count
 
     def _build_batch_options(self, *, test_mode: bool) -> BatchOptions:
         input_dir = Path(self._input_edit.text().strip())
@@ -461,8 +541,9 @@ class MainWindow(QtWidgets.QMainWindow):
             skip_existing=self._skip_checkbox.isChecked(),
             recursive=self._recursive_checkbox.isChecked(),
             collision_policy=str(self._collision_combo.currentData()),
-            sharpen_strength=str(self._sharpen_combo.currentData()),
-            crop_options=self._build_crop_options(),
+            sharpen_method=str(self._sharpen_method_combo.currentData()),
+            sharpen_strength=str(self._sharpen_strength_combo.currentData()),
+            crop_options=self._build_batch_crop_options(),
             test_mode=test_mode,
             test_limit=5,
         )
@@ -482,7 +563,11 @@ class MainWindow(QtWidgets.QMainWindow):
             tile_overlap=int(self._tile_overlap_spin.value()),
             skip_existing=self._skip_checkbox.isChecked(),
             collision_policy=str(self._collision_combo.currentData()),
-            crop_options=self._build_crop_options(),
+            sharpen_methods=self._selected_comparison_methods(),
+            sharpen_strengths=self._selected_comparison_strengths(),
+            include_full_image=self._comparison_include_full_checkbox.isChecked(),
+            include_crop_image=self._comparison_include_crop_checkbox.isChecked(),
+            crop_ratio=str(self._crop_ratio_combo.currentData() or self._crop_ratio_combo.currentText()),
         )
 
     def _launch_worker(self, task_callable, start_message: str) -> None:
@@ -555,12 +640,34 @@ class MainWindow(QtWidgets.QMainWindow):
                 "1枚比較処理には x2 と x4 の両方の公式モデルが必要です。",
             )
             return
+        if not self._selected_comparison_methods():
+            QtWidgets.QMessageBox.warning(
+                self,
+                "比較方式",
+                "比較用のシャープ方式を 1 つ以上選択してください。",
+            )
+            return
+        if not self._selected_comparison_strengths():
+            QtWidgets.QMessageBox.warning(
+                self,
+                "比較強度",
+                "比較用のシャープ強度を 1 つ以上選択してください。",
+            )
+            return
+        if not self._comparison_include_full_checkbox.isChecked() and not self._comparison_include_crop_checkbox.isChecked():
+            QtWidgets.QMessageBox.warning(
+                self,
+                "比較範囲",
+                "全体版か crop 版のどちらかは有効にしてください。",
+            )
+            return
 
         options = self._build_comparison_options()
         task_callable = partial(run_comparison, options)
         self._launch_worker(
             task_callable,
-            "1枚比較処理を開始します。comparison フォルダへ x2/x4 と シャープなし/弱/中 を出力します...",
+            "1枚比較処理を開始します。"
+            f" comparison フォルダへ {self._estimate_comparison_variant_count()} パターン前後を出力します...",
         )
 
     def _handle_progress(self, payload: dict) -> None:
