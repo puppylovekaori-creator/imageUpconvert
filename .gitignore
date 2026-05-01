@@ -26,5 +26,6 @@ temp/
 config.json
 tools/gimp_pdb_query_out.txt
 
+vendor/gimp_upscale/
 vendor/SwinIR/__pycache__/
 vendor/SwinIR/**/*.pyc

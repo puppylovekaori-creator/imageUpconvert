@@ -6,69 +6,110 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$modelDir = Join-Path $repoRoot 'models\swinir'
-New-Item -ItemType Directory -Force -Path $modelDir | Out-Null
-
-$models = @(
-    @{
-        Name = '001_classicalSR_DF2K_s64w8_SwinIR-M_x2.pth'
-        Url = 'https://github.com/JingyunLiang/SwinIR/releases/download/v0.0/001_classicalSR_DF2K_s64w8_SwinIR-M_x2.pth'
-        Size = 67277475
-    },
-    @{
-        Name = '001_classicalSR_DF2K_s64w8_SwinIR-M_x4.pth'
-        Url = 'https://github.com/JingyunLiang/SwinIR/releases/download/v0.0/001_classicalSR_DF2K_s64w8_SwinIR-M_x4.pth'
-        Size = 67869037
-    },
-    @{
-        Name = '002_lightweightSR_DIV2K_s64w8_SwinIR-S_x2.pth'
-        Url = 'https://github.com/JingyunLiang/SwinIR/releases/download/v0.0/002_lightweightSR_DIV2K_s64w8_SwinIR-S_x2.pth'
-        Size = 17147989
-    },
-    @{
-        Name = '002_lightweightSR_DIV2K_s64w8_SwinIR-S_x4.pth'
-        Url = 'https://github.com/JingyunLiang/SwinIR/releases/download/v0.0/002_lightweightSR_DIV2K_s64w8_SwinIR-S_x4.pth'
-        Size = 17225941
-    },
-    @{
-        Name = '003_realSR_BSRGAN_DFO_s64w8_SwinIR-M_x4_GAN.pth'
-        Url = 'https://github.com/JingyunLiang/SwinIR/releases/download/v0.0/003_realSR_BSRGAN_DFO_s64w8_SwinIR-M_x4_GAN.pth'
-        Size = 67129861
-    },
-    @{
-        Name = '003_realSR_BSRGAN_DFOWMFC_s64w8_SwinIR-L_x4_GAN.pth'
-        Url = 'https://github.com/JingyunLiang/SwinIR/releases/download/v0.0/003_realSR_BSRGAN_DFOWMFC_s64w8_SwinIR-L_x4_GAN.pth'
-        Size = 142473939
-    }
+$vendorRoot = Join-Path $repoRoot 'vendor\gimp_upscale'
+$targetDir = Join-Path $vendorRoot 'resrgan'
+$requiredModels = @(
+    'UltraSharp-4x',
+    'RealESRGAN_General_x4_v3',
+    'realesrgan-x4plus',
+    'realesrgan-x4plus-anime',
+    'AnimeSharp-4x',
+    'realesr-animevideov3-x4'
 )
 
-foreach ($model in $models) {
-    $targetPath = Join-Path $modelDir $model.Name
-    $tempPath = "$targetPath.part"
-
-    if ((Test-Path $targetPath) -and -not $Force) {
-        $existingLength = (Get-Item $targetPath).Length
-        if ($existingLength -eq $model.Size) {
-            Write-Host "skip $($model.Name)"
-            continue
+function Test-BackendReady {
+    param([string]$DirPath)
+    if (-not (Test-Path (Join-Path $DirPath 'realesrgan-ncnn-vulkan.exe'))) {
+        return $false
+    }
+    $modelDir = Join-Path $DirPath 'models'
+    if (-not (Test-Path $modelDir)) {
+        return $false
+    }
+    foreach ($model in $requiredModels) {
+        if (-not (Test-Path (Join-Path $modelDir "$model.param"))) {
+            return $false
         }
-        Write-Host "re-download $($model.Name) because size mismatch: $existingLength / expected $($model.Size)"
+        if (-not (Test-Path (Join-Path $modelDir "$model.bin"))) {
+            return $false
+        }
     }
-
-    if (Test-Path $tempPath) {
-        Remove-Item -LiteralPath $tempPath -Force
-    }
-
-    Write-Host "download $($model.Name)"
-    Invoke-WebRequest -Uri $model.Url -OutFile $tempPath
-
-    $downloadedLength = (Get-Item $tempPath).Length
-    if ($downloadedLength -ne $model.Size) {
-        Remove-Item -LiteralPath $tempPath -Force
-        throw "Downloaded size mismatch for $($model.Name): $downloadedLength / expected $($model.Size)"
-    }
-
-    Move-Item -LiteralPath $tempPath -Destination $targetPath -Force
+    return $true
 }
 
-Write-Host 'model download completed'
+if ((-not $Force) -and (Test-BackendReady -DirPath $targetDir)) {
+    Write-Host 'skip existing backend'
+    exit 0
+}
+
+$headers = @{
+    'User-Agent' = 'imageUpconvert-setup'
+    'Accept' = 'application/vnd.github+json'
+}
+
+Write-Host 'fetch latest gimp_upscale release metadata'
+$release = Invoke-RestMethod -Uri 'https://api.github.com/repos/Nenotriple/gimp_upscale/releases/latest' -Headers $headers
+$asset = $release.assets | Where-Object { $_.name -eq 'gimp3_upscale.zip' } | Select-Object -First 1
+if (-not $asset) {
+    $asset = $release.assets | Where-Object { $_.name -like 'gimp*_upscale.zip' } | Select-Object -First 1
+}
+if (-not $asset) {
+    throw 'gimp_upscale release asset was not found.'
+}
+
+$tempRoot = Join-Path $env:TEMP ("imageupconvert_" + [guid]::NewGuid().ToString('N'))
+$zipPath = Join-Path $tempRoot $asset.name
+$extractRoot = Join-Path $tempRoot 'extract'
+
+New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
+New-Item -ItemType Directory -Force -Path $extractRoot | Out-Null
+New-Item -ItemType Directory -Force -Path $vendorRoot | Out-Null
+
+try {
+    Write-Host "download $($asset.name)"
+    Invoke-WebRequest -Uri $asset.browser_download_url -Headers $headers -OutFile $zipPath
+    Expand-Archive -Path $zipPath -DestinationPath $extractRoot -Force
+
+    $resrganDir = Get-ChildItem -Path $extractRoot -Recurse -Directory -ErrorAction Stop |
+        Where-Object { $_.Name -eq 'resrgan' } |
+        Select-Object -First 1
+    if (-not $resrganDir) {
+        throw 'resrgan directory was not found in the downloaded archive.'
+    }
+
+    $stagingDir = Join-Path $tempRoot 'staging\resrgan'
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $stagingDir) | Out-Null
+    Copy-Item -Path $resrganDir.FullName -Destination $stagingDir -Recurse -Force
+
+    if (-not (Test-BackendReady -DirPath $stagingDir)) {
+        throw 'downloaded backend is missing required executable or models.'
+    }
+
+    if (Test-Path $targetDir) {
+        Remove-Item -LiteralPath $targetDir -Recurse -Force
+    }
+    Move-Item -LiteralPath $stagingDir -Destination $targetDir -Force
+
+    $manifest = [ordered]@{
+        tag_name = $release.tag_name
+        release_name = $release.name
+        asset_name = $asset.name
+        asset_url = $asset.browser_download_url
+        downloaded_at = (Get-Date).ToString('o')
+    }
+    $manifestPath = Join-Path $vendorRoot 'backend_manifest.json'
+    $manifest | ConvertTo-Json -Depth 4 | Set-Content -Path $manifestPath -Encoding UTF8
+
+    Write-Host 'downloaded backend models:'
+    Get-ChildItem -Path (Join-Path $targetDir 'models') -Filter *.param |
+        Select-Object -ExpandProperty BaseName |
+        Sort-Object |
+        ForEach-Object { Write-Host "  $_" }
+}
+finally {
+    if (Test-Path $tempRoot) {
+        Remove-Item -LiteralPath $tempRoot -Recurse -Force
+    }
+}
+
+Write-Host 'backend download completed'

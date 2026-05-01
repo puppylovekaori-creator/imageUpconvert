@@ -1,361 +1,186 @@
-# SwinIR + GIMP 低侵襲高解像度化 GUI
+# GIMP AI Upscale 一括処理GUIツール
 
-このツールは、**顔を作り替えない低侵襲な高解像度化**を目的にした Windows 用 GUI です。
+Windows 用の `Python + PySide6` GUI です。  
+大量の人物画像に対して、GIMP 前処理と GIMP AI Upscale 系 backend を安全に一括適用し、元画像を壊さずに参照候補を増やすことを目的にしています。
 
-- 顔補正ツールではありません
-- 顔復元はしません
-- 美顔化はしません
-- 生成補完はしません
-- Stable Diffusion 系の再生成はしません
-- GFPGAN / CodeFormer / SUPIR / StableSR / img2img は実装していません
+## 重要
 
-目的は、人物参照 core 候補の画像を、GIMP で確認済みの軽いノイズ除去とアンシャープマスクで整え、必要なときだけ SwinIR を使って、**本人性を崩さずに** 見やすさ改善や高解像度化を行うことです。
+- このツールは **GIMP 依存** です
+- **GIMP パスは GUI で指定** してください
+- **元画像は絶対に上書きしません**
+- **まず 1枚比較処理 を行ってください**
+- 次に **先頭5枚テスト** を行ってください
+- 問題なければ **先頭20枚テスト**、その後に **一括処理** を行ってください
+- 4000 枚規模ではかなり時間がかかります
+- まずは **AI Upscaleのみ** で回し、必要な場合だけ前処理を追加する運用を推奨します
+- **切り抜きは標準ルートに含めません**
+- **本人性維持を最優先** とし、不自然な画像は採用しないでください
 
-## このツールの考え方
+## 実装方針
 
-- 最優先は **本人性維持** です
-- 強い補正より、顔立ち・輪郭・目鼻口・髪型の保持を優先します
-- 通常画面には SwinIR モデル選択 UI を出していません
-- SwinIR は内部既定値の **classical_sr x2 / x4** を使います
-- ユーザーが主に調整するのは **GIMP 前処理のノイズ除去とアンシャープマスク** です
-- 処理モードで **GIMPのみ / SwinIRのみ / GIMP前処理 + SwinIR / GIMP前処理 + SwinIR + GIMP後処理** を切り替えます
+- GUI: `PySide6`
+- 前処理: GIMP を `subprocess` でバッチ呼び出し
+- AI Upscale:
+  - まず `gimp_plugin_direct` を試行
+  - 安定呼び出しが難しい場合は `external_realesrgan` にフォールバック
+  - 実際に使った方式は `processing_log.csv` に記録
+- 設定保存: `config.json`
+- ログ: `processing_log.csv`, `failed_log.csv`
+- 起動: `run_gui.bat`
+- 初回セットアップ: `setup.bat`
 
-## 何を使っているか
+現在の実装では、GIMP 2 の AI Upscale プラグインが入っている場合のみ `gimp_plugin_direct` を優先し、それ以外は `setup.bat` で取得する `external_realesrgan` backend を使います。  
+GIMP 3 ではモデル選択付きの非対話プラグイン直実行が不安定なため、安定側として `external_realesrgan` を採用しています。
 
-- GUI: `Python + PySide6`
-- 高解像度化: `vendor/SwinIR`
-- モデル: **SwinIR 公式の学習済みモデル**
-- 推論バックエンド: `PyTorch`
-- GIMP 前後処理: **ローカルにインストールされた GIMP を外部コマンドとして呼び出し**
-- 人物切り抜き: `rembg` (`u2net_human_seg`)
+## 対応処理モード
 
-独自学習、追加学習、ファインチューニングは行いません。
+- `AI Upscaleのみ`
+- `GIMP前処理のみ`
+- `GIMP前処理 + AI Upscale`
 
-## GIMP 依存について
+## GUI で指定できる項目
 
-このツールは **GIMP に依存する処理を含みます**。
-
-- GIMP 未導入でも、**SwinIRのみ** モードなら SwinIR 単体処理はできます
-- **GIMPのみ**、**GIMP前処理 + SwinIR**、**GIMP前処理 + SwinIR + GIMP後処理** は GIMP が必要です
-- GIMP 前処理 / 後処理を使う場合は、GUI で **GIMP 実行ファイルパス** を指定してください
-- 例:
-  - `C:\Program Files\GIMP 2\bin\gimp-console-2.10.exe`
-  - `C:\Program Files\GIMP 2\bin\gimp-2.10.exe`
-  - `C:\Program Files\GIMP 3\bin\gimp-console-3.exe`
-  - `C:\Program Files\GIMP 3\bin\gimp.exe`
-
-起動時にパスの存在確認を行い、未設定や不正パスなら GUI 上に分かりやすく表示します。
-
-## 特徴
-
-- GUI は `実行` タブと `設定` タブに分かれています
-- GIMP 実行ファイルパス指定
-- 入力フォルダ / 出力フォルダ指定
-- プレビュー対象画像 1 枚指定
+- 入力フォルダ
+- 出力フォルダ
+- GIMP 実行ファイルパス
 - 処理モード
-  - `GIMPのみ`
-  - `SwinIRのみ`
-  - `GIMP前処理 + SwinIR`
-  - `GIMP前処理 + SwinIR + GIMP後処理`
-- プレビュー範囲選択
-  - `全体`
-  - `中央crop`
-  - `顔付近crop`
-- GIMP 前処理のノイズ除去
-  - `OFF / 弱 / 中 / 強 / 詳細設定`
-- GIMP 前処理のアンシャープマスク
-  - `OFF / 弱 / 中 / 強 / 詳細設定`
-- SwinIR 倍率
-  - `2x / 4x`
-- GIMP 後処理の強さ
-  - `なし / 弱 / 中 / 強`
-- 人物切り抜き ON / OFF
-- プレビュー比較表示
-  - 本体 GUI とは別ウィンドウで開く
-  - 左側の一覧をクリックして切り替え
-  - 元画像
-  - GIMP 前処理後または GIMP処理後
-  - SwinIR 後または SwinIRのみ参考
-  - 最終出力
-  - プレビュー画面から `表示中を保存` / `元画像を保存` / `横並び比較を保存` ができる
-  - 保存時は `最高画質 / 高画質 / 標準 / 軽量 / カスタム` を選べる
-  - JPEG / WEBP は画質指定、PNG は可逆のまま圧縮率だけ調整する
-- `1枚比較処理`
-  - `original`
-  - `gimp_only`
-  - `swinir_only`
-  - `gimp_pre_swinir`
-  - `gimp_pre_swinir_gimp_post`
-  - `gimp_only_cutout` (`人物切り抜き ON のとき`)
-  - `gimp_pre_swinir_cutout` (`人物切り抜き ON のとき`)
-- `テスト処理`
-  - 先頭 5 枚だけを `output_test` に出力
-- 設定保存 / 次回起動時の復元
-- CPU / GPU 状況表示
-- 停止 / キャンセル
-- 進捗バー
-- 失敗時も GUI 全体が落ちにくい設計
-- `processing_log.csv` / `failed_log.csv`
-- 失敗ファイルを `failed/` にコピー
-- 透過 PNG の alpha 保持
-- 元画像は絶対に上書きしない
+- アップスケール倍率
+- アップスケールモデル
+- GIMP 前処理 ON/OFF
+- ノイズ除去設定
+- アンシャープ設定
+- サブフォルダ処理 ON/OFF
+- 処理済みスキップ ON/OFF
 
-## SwinIR モデル
+## 対応モデル
 
-通常画面ではモデル選択を出していません。SwinIR を使うモードのときだけ、内部で次を使います。
-
-- `models/swinir/001_classicalSR_DF2K_s64w8_SwinIR-M_x2.pth`
-- `models/swinir/001_classicalSR_DF2K_s64w8_SwinIR-M_x4.pth`
-
-人物参照用途では、まず **2x** を推奨します。
-
-- `2x`
-  - 変化が比較的穏やか
-  - まず確認する基準
-- `4x`
-  - さらに大きくなる
-  - ファイルサイズがかなり増えやすい
-  - 見た目の改善が小さい場合もある
-
-## 処理モード
-
-- `GIMPのみ`
-  - GIMP のノイズ除去とアンシャープマスクだけで見やすさ改善します
-  - SwinIR は使いません
-- `SwinIRのみ`
-  - GIMP を使わずに高解像度化だけ行います
-- `GIMP前処理 + SwinIR`
-  - GIMP 前処理で眠さを軽く取り、その後 SwinIR で拡大します
-- `GIMP前処理 + SwinIR + GIMP後処理`
-  - GIMP 前処理と SwinIR に加え、最後に軽い GIMP 後処理をかけます
-
-人物切り抜きは処理モードとは別の ON / OFF です。
-
-## GIMP 前処理 / 後処理
-
-### GIMP 前処理
-
-目的:
-
-- 圧縮ノイズやざらつきの軽減
-- 元画像の眠さを軽く取る
+- `UltraSharp-4x`
+- `RealESRGAN_General_x4_v3`
+- `realesrgan-x4plus`
+- `realesrgan-x4plus-anime`
+- `AnimeSharp-4x`
+- `realesr-animevideov3-x4`
 
 初期値:
 
+- モデル: `UltraSharp-4x`
+- 倍率: `4x`
+- 前処理: `OFF`
 - ノイズ除去: `弱`
-- アンシャープマスク: `弱`
-
-### GIMP 後処理
-
-目的:
-
-- SwinIR 後に軽く輪郭を整える
-
-初期値:
-
-- `なし`
-
-### 強すぎる設定について
-
-強いノイズ除去や強いシャープは
-
-- 白フチ
-- 黒フチ
-- ハロ
-- ギラつき
-- ノイズ強調
-- 暗部つぶれ
-- 本人らしさの低下
-
-を起こす可能性があります。
-
-**顔が変わって見える設定は採用しないでください。**
-
-## 人物切り抜き
-
-- 人物切り抜きは `rembg` の `u2net_human_seg` を使います
-- 出力は PNG 透過です
-- 既に透過がある画像は、元の alpha と切り抜き alpha を重ねて扱います
-
-## 透過 PNG について
-
-- alpha チャンネルは保持します
-- SwinIR へは RGB 部分だけを渡します
-- alpha は別経路で Lanczos 拡大します
-- 最後に RGB と alpha を再合成して RGBA PNG として保存します
-- 透明部分の色に引っ張られて白フチや黒フチが出にくいよう、完全透明部には近傍色をにじませてから RGB 拡大します
-
-## 初期値
-
-- GIMP 前処理: `ON`
-- ノイズ除去: `弱`
-- アンシャープマスク: `弱`
-- 処理モード: `GIMP前処理 + SwinIR`
-- SwinIR 倍率: `2x`
-- GIMP 後処理: `OFF`
-- 人物切り抜き: `OFF`
-- プレビュー範囲: `顔付近crop`
-- プレビュー crop 比率: `4:5`
-- tile size: `400`
-- tile overlap: `32`
-- 既存出力スキップ: `ON`
+- アンシャープ: `弱`
 - サブフォルダ処理: `OFF`
+- 処理済みスキップ: `ON`
 
-## 導入手順
+## 前処理
 
-### 1. Python を入れる
+前処理では以下を使えます。
 
-まず Python をインストールしてください。
+- ノイズ除去: `OFF / 弱 / 中 / 強`
+- アンシャープ: `OFF / 弱 / 中 / 強`
 
-推奨:
+## 比較処理
 
-- Python `3.10` から `3.13`
-
-### 2. GIMP を入れる
-
-GIMP 前処理 / 後処理を使いたい場合は、先に GIMP をインストールしてください。
-
-### 3. `setup.bat` を実行する
-
-初回は **必ず `setup.bat`** を実行してください。
-
-このスクリプトは次を行います。
-
-- `%LOCALAPPDATA%\imageUpconvert\venv` に venv 作成
-- `requirements.txt` のインストール
-- CPU 版 PyTorch の最小構成インストール
-- GUI が使う公式 SwinIR の `2x / 4x` モデルをダウンロード
-- 簡易環境確認
-
-`requirements.txt` には、人物切り抜き用の `rembg` も含まれます。
-
-### 4. `run_gui.bat` を実行する
-
-起動は **`run_gui.bat` のダブルクリック** です。
-
-## GPU を使いたい場合
-
-CPU 版の代わりに GPU 版 PyTorch を使いたい場合は、**PyTorch 公式のインストールページ**で自分の CUDA 環境に合うコマンドを確認してください。
-
-- [PyTorch Get Started](https://pytorch.org/get-started/locally/)
-
-方針:
-
-- `setup.bat` は GPU を決め打ちしません
-- GUI では `torch.cuda.is_available()` の結果を表示します
-
-## 使い方
-
-### 1. GIMP パスを設定する
-
-GUI の `GIMP 実行ファイル` に、`gimp-console.exe` または `gimp.exe` を指定します。
-
-### 2. 処理モードを決める
-
-- まずは `GIMPのみ` か `GIMP前処理 + SwinIR` から確認してください
-- 高解像度化が不要なら `GIMPのみ` を使えます
-- 高解像度化したい場合だけ `SwinIR` を含むモードを選んでください
-
-### 3. まず 1 枚プレビューで設定を決める
-
-1. `プレビュー対象画像 / 比較用1枚` に 1 枚指定
-2. `顔付近crop` または `中央crop` を選ぶ
-3. ノイズ除去とアンシャープマスクを調整
-4. `プレビュー生成`
-5. プレビューは別ウィンドウで開くので、左側の一覧をクリックしながら `元画像 / 中間段階 / 最終出力` を見比べる
-6. 必要ならプレビュー画面の `表示中を保存`、`元画像を保存`、`横並び比較を保存` を使って結果を書き出す
-7. 保存画質は `最高画質` を基準に、容量を落としたいときだけ `高画質 / 標準 / 軽量 / カスタム` を使う
-
-### 4. 必要なら 1 枚比較処理を行う
-
-`1枚比較処理` を実行すると、`comparison` フォルダに次が出ます。
+`1枚比較処理` は入力フォルダの先頭 1 枚を使い、出力フォルダ配下の `comparison` フォルダに以下を保存します。
 
 - `original`
-- `gimp_only`
-- `swinir_only`
-- `gimp_pre_swinir`
-- `gimp_pre_swinir_gimp_post`
-- `gimp_only_cutout` (`人物切り抜き ON のとき`)
-- `gimp_pre_swinir_cutout` (`人物切り抜き ON のとき`)
+- `gimp_pre`
+- `upscale_only`
+- `gimp_pre_upscale`
 
-### 5. 大量処理前に必ず 5 枚テストを行う
+ファイル名には処理内容を含めます。
 
-大量処理前に、必ず **`テスト処理（先頭5枚）`** を実行してください。
+## 一括処理
 
-### 6. 問題なければ一括処理
-
-`一括処理開始` を実行します。処理前に、対象枚数と設定概要の確認ダイアログが出ます。
+- 対象拡張子: `jpg`, `jpeg`, `png`, `webp`
+- サブフォルダ処理 ON のときは再帰処理します
+- 出力ファイルは常に **別名 PNG** として保存します
+- 例:
+  - `sample_upscale_ultrasharp4x.png`
+  - `sample_pre_noiseWeak_sharpMedium_upscale_ultrasharp4x.png`
 
 ## 安全設計
 
 - 元画像は絶対に上書きしません
-- 出力先が入力先と同じ場合は止めます
-- 出力先が入力フォルダの内側でも止めます
-- GIMP 処理に失敗した場合は次工程へ進みません
-- 失敗ファイルは `failed/` にコピーします
-- キャンセル時に中途半端な出力を成功扱いしないよう、最後に一時ファイルからリネームしています
-- 日本語パス、空白を含むパスを想定しています
-
-## 出力ファイル名
-
-通常処理:
-
-- `元名_gimp_only.png`
-- `元名_swinir_x2.png`
-- `元名_gimp_pre_swinir_x2.png`
-- `元名_gimp_pre_swinir_x2_gimp_post.png`
-- 人物切り抜きを使う場合は `_cutout`
-
-例:
-
-- `sample_gimp_only.png`
-- `sample_swinir_x2.png`
-- `sample_gimp_pre_swinir_x2.png`
-- `sample_gimp_pre_swinir_x4_gimp_post_cutout.png`
+- 入力フォルダと出力フォルダが同じ場合は開始しません
+- 出力フォルダが入力フォルダ配下でも開始しません
+- GIMP パスが未設定または無効なら開始しません
+- 処理済みスキップにより再開できます
+- GUI は別スレッドで処理します
+- 停止ボタンで現在ファイル単位の安全停止を行います
+- 中途半端なファイルは成功扱いしません
+- 日本語パス、空白を含むパスに対応します
 
 ## ログ
 
-出力フォルダに次を作成します。
+出力フォルダ配下に以下を出します。
 
 - `processing_log.csv`
 - `failed_log.csv`
+- `failed\`
 
-失敗ファイルは `failed/` にコピーします。
-
-主な記録項目:
+`processing_log.csv` には少なくとも以下を記録します。
 
 - 処理日時
-- 処理モード
 - 入力ファイル
 - 出力ファイル
+- 処理モード
 - 元画像サイズ
-- SwinIR 入力サイズ
 - 出力画像サイズ
-- SwinIR 使用有無
-- 指定倍率
-- 実際の倍率
-- 使用内部モデル
-- tile size
-- tile overlap
-- alpha 有無
-- プレビュー範囲
 - GIMP パス
-- GIMP バージョン
-- GIMP 前処理の有無
+- 使用実行方式
+- 使用モデル
+- 倍率
+- GIMP 前処理有無
 - ノイズ除去設定
-- アンシャープマスク設定
-- GIMP 後処理の有無
-- 後処理アンシャープ設定
-- 人物切り抜きの有無
-- GIMP の終了コード
-- GIMP の標準出力 / 標準エラー
-- 成功 / 失敗
+- アンシャープ設定
+- 成功 / 失敗 / スキップ / 停止
 - エラー内容
 - 処理時間
 
-## 補足
+## セットアップ
 
-- GIMP 未導入でも、GIMP 前後処理を OFF にすれば SwinIR 単体処理は可能です
-- 最初は **2x + ノイズ除去 弱 + アンシャープ 弱** から確認してください
-- 4x は常に正解ではありません
-- 強いノイズ除去や強いシャープは本人性を損ねる可能性があります
+### 1. Python
+
+Python `3.10` から `3.13` を使ってください。
+
+### 2. GIMP
+
+GIMP をインストールしてください。GUI で以下のような実行ファイルを指定できます。
+
+- `C:\Program Files\GIMP 2\bin\gimp-console-2.10.exe`
+- `C:\Program Files\GIMP 2\bin\gimp-2.10.exe`
+- `C:\Program Files\GIMP 3\bin\gimp-console-3.exe`
+- `C:\Program Files\GIMP 3\bin\gimp.exe`
+
+### 3. setup.bat
+
+初回は `setup.bat` を実行してください。
+
+`setup.bat` が行うこと:
+
+- `%LOCALAPPDATA%\imageUpconvert\venv` を作成
+- `requirements.txt` をインストール
+- `gimp_upscale` リリース由来の `external_realesrgan` backend とモデルを `vendor\gimp_upscale\resrgan` に取得
+- GUI スモークテスト実行
+
+### 4. run_gui.bat
+
+通常起動は `run_gui.bat` のダブルクリックです。
+
+## 完成条件に対する現在の挙動
+
+- `setup.bat` 実行後、`run_gui.bat` で起動
+- GUI から GIMP パス / 入力 / 出力を指定
+- `1枚比較処理`
+- `先頭5枚テスト`
+- `先頭20枚テスト`
+- フォルダ一括処理
+- CSV ログ出力
+- 失敗画像分離
+- 途中停止と再開
+
+## 注意
+
+- このツールは「劇的に別人レベルへ変える」用途ではありません
+- 目的は「元画像より少し良くする」「使える候補を増やす」です
+- 不自然さが出た画像は採用しないでください

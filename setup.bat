@@ -13,7 +13,7 @@ if not defined PYTHON_CMD (
 echo Using %PYTHON_CMD%
 
 set "VENV_DIR=%LOCALAPPDATA%\imageUpconvert\venv"
-echo Virtual environment: %VENV_DIR%
+echo Virtual environment: LOCALAPPDATA\imageUpconvert\venv
 
 if not exist "%VENV_DIR%\Scripts\python.exe" (
     if not exist "%LOCALAPPDATA%\imageUpconvert" mkdir "%LOCALAPPDATA%\imageUpconvert"
@@ -36,39 +36,30 @@ for %%P in ("%VENV_DIR%\Lib\site-packages\~ip*" "%VENV_DIR%\Lib\site-packages\~i
 "%VENV_PYTHON%" -m ensurepip --upgrade
 if errorlevel 1 goto :pip_error
 
+"%VENV_PYTHON%" -m pip install --disable-pip-version-check --upgrade pip
+if errorlevel 1 goto :pip_error
+
 "%VENV_PYTHON%" -m pip install --disable-pip-version-check -r requirements.txt
 if errorlevel 1 goto :pip_error
 
-"%VENV_PYTHON%" -m pip show torch >nul 2>nul
-if errorlevel 1 (
-    echo Installing CPU PyTorch as the default first setup...
-    echo If you want CUDA later, replace torch using the command from the official PyTorch site.
-    "%VENV_PYTHON%" -m pip install --disable-pip-version-check torch torchvision --index-url https://download.pytorch.org/whl/cpu
-    if errorlevel 1 goto :pip_error
-) else (
-    echo torch is already installed. Skipping CPU reinstall.
-)
-
-echo Installing timm after torch so pip does not choose a PyTorch build automatically...
-"%VENV_PYTHON%" -m pip install --disable-pip-version-check timm==0.9.16 --no-deps
-if errorlevel 1 goto :pip_error
-
 echo.
-echo Downloading official SwinIR models for the GUI-supported 2x and 4x modes...
+echo Downloading GIMP AI Upscale compatible backend and models...
 powershell -NoProfile -ExecutionPolicy Bypass -File "%CD%\tools\download_models.ps1"
 if errorlevel 1 goto :pip_error
 
 echo.
-echo Environment check:
-"%VENV_PYTHON%" -m app.env_check
+echo GUI smoke test:
+"%VENV_PYTHON%" -m app.main --smoke-test
+if errorlevel 1 goto :pip_error
 
 echo.
 echo Setup completed.
 echo Next steps:
 echo 1. Double-click run_gui.bat
+echo 2. Set GIMP path, input folder, and output folder in the GUI.
+echo 3. Run comparison first, then test_5, then test_20, then batch.
 echo.
-echo venv location:
-echo %VENV_DIR%
+echo Venv location: LOCALAPPDATA\imageUpconvert\venv
 pause
 exit /b 0
 
@@ -89,7 +80,6 @@ goto :eof
 
 :pip_error
 echo Installation failed.
-echo Review the error above. If this is a PyTorch GPU setup case, use the command from:
-echo https://pytorch.org/get-started/locally/
+echo Review the error above.
 pause
 exit /b 1

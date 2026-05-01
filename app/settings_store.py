@@ -1,26 +1,34 @@
 from __future__ import annotations
 
+from dataclasses import asdict, fields
 import json
-from pathlib import Path
 from typing import Any
 
+from .app_config import AppSettings, CONFIG_PATH
 
-APP_ROOT = Path(__file__).resolve().parent.parent
-CONFIG_PATH = APP_ROOT / "config.json"
-
-
-def load_settings() -> dict[str, Any]:
+def load_settings() -> AppSettings:
     if not CONFIG_PATH.exists():
-        return {}
+        return AppSettings()
 
     try:
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except Exception:
-        return {}
+        return AppSettings()
+    if not isinstance(raw, dict):
+        return AppSettings()
+
+    allowed = {field.name for field in fields(AppSettings)}
+    data = {key: value for key, value in raw.items() if key in allowed}
+    return AppSettings(**data)
 
 
-def save_settings(data: dict[str, Any]) -> None:
+def save_settings(data: AppSettings | dict[str, Any]) -> None:
+    payload: dict[str, Any]
+    if isinstance(data, AppSettings):
+        payload = asdict(data)
+    else:
+        payload = asdict(AppSettings(**data))
     CONFIG_PATH.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2),
+        json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )

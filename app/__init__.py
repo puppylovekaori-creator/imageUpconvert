@@ -1,1 +1,1 @@
-"""SwinIR GUI application package."""
+"""GIMP AI Upscale batch GUI package."""

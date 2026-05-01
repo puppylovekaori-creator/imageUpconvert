@@ -5,8 +5,7 @@ cd /d "%~dp0"
 set "VENV_DIR=%LOCALAPPDATA%\imageUpconvert\venv"
 
 if not exist "%VENV_DIR%\Scripts\python.exe" (
-    echo venv was not found at:
-    echo %VENV_DIR%
+    echo venv was not found under LOCALAPPDATA\imageUpconvert\venv
     echo Please run setup.bat first.
     pause
     exit /b 1
