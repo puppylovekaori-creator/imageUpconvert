@@ -1,0 +1,3 @@
+Source repository: https://github.com/JingyunLiang/SwinIR
+Vendored snapshot commit: 6545850fbf8df298df73d81f3e8cba638787c8bd
+Vendoring method: cloned outside the Dropbox worktree, then copied into vendor/SwinIR as tracked source files.
