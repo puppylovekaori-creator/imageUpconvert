@@ -71,7 +71,23 @@ def build_output_path(
 ) -> Path | None:
     relative_parent = input_path.parent.relative_to(input_root)
     output_dir = output_root / relative_parent
-    candidate = output_dir / f"{input_path.stem}{suffix}.png"
+    return build_flat_output_path(
+        input_path=input_path,
+        output_root=output_dir,
+        suffix=suffix,
+        collision_policy=collision_policy,
+        skip_existing=skip_existing,
+    )
+
+
+def build_flat_output_path(
+    input_path: Path,
+    output_root: Path,
+    suffix: str,
+    collision_policy: str,
+    skip_existing: bool,
+) -> Path | None:
+    candidate = output_root / f"{input_path.stem}{suffix}.png"
 
     if not candidate.exists():
         return candidate
@@ -84,7 +100,7 @@ def build_output_path(
 
     serial_index = 1
     while True:
-        serial_candidate = output_dir / f"{input_path.stem}{suffix}_{serial_index:02d}.png"
+        serial_candidate = output_root / f"{input_path.stem}{suffix}_{serial_index:02d}.png"
         if not serial_candidate.exists():
             return serial_candidate
         serial_index += 1

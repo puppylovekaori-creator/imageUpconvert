@@ -12,6 +12,12 @@ models/swinir/*.pt
 output/*
 !output/.gitkeep
 
+output_test/*
+!output_test/.gitkeep
+
+comparison/*
+!comparison/.gitkeep
+
 failed/*
 !failed/.gitkeep
 

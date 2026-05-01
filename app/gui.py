@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from functools import partial
 from pathlib import Path
 
 from PySide6 import QtCore, QtWidgets
@@ -8,10 +9,13 @@ from PySide6 import QtCore, QtWidgets
 from .env_check import format_runtime_status, get_runtime_status
 from .swinir_runner import (
     BatchOptions,
+    ComparisonOptions,
+    CropOptions,
     InterruptController,
     detect_model_scale_from_filename,
     infer_model_descriptor,
     run_batch,
+    run_comparison,
 )
 
 
@@ -24,17 +28,19 @@ TASK_PRIORITY = {
     "lightweight_sr": 1,
     "real_sr": 2,
 }
+CROP_RATIO_CHOICES = ["1:1", "4:5", "3:4", "2:3", "16:9", "9:16"]
+SUPPORTED_FILE_FILTER = "画像 (*.jpg *.jpeg *.png *.webp);;すべてのファイル (*.*)"
 
 
-class BatchWorker(QtCore.QThread):
+class TaskWorker(QtCore.QThread):
     progress_signal = QtCore.Signal(dict)
     message_signal = QtCore.Signal(str)
     finished_signal = QtCore.Signal(dict)
     error_signal = QtCore.Signal(str)
 
-    def __init__(self, options: BatchOptions) -> None:
+    def __init__(self, task_callable) -> None:
         super().__init__()
-        self._options = options
+        self._task_callable = task_callable
         self._stop_requested = False
         self._cancel_requested = False
 
@@ -56,8 +62,7 @@ class BatchWorker(QtCore.QThread):
             is_cancel_requested=self._is_cancel_requested,
         )
         try:
-            summary = run_batch(
-                self._options,
+            summary = self._task_callable(
                 progress_callback=self.progress_signal.emit,
                 message_callback=self.message_signal.emit,
                 controller=controller,
@@ -71,8 +76,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("SwinIR 画像高解像度化 GUI")
-        self.resize(980, 720)
-        self._worker: BatchWorker | None = None
+        self.resize(1040, 820)
+        self._worker: TaskWorker | None = None
         self._available_models_by_scale: dict[int, list[Path]] = {}
         self._preferred_model_by_scale: dict[int, Path] = {}
 
@@ -80,11 +85,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self._output_edit = QtWidgets.QLineEdit(str(DEFAULT_OUTPUT_DIR))
         self._model_edit = QtWidgets.QLineEdit(str(DEFAULT_MODEL_PATH))
         self._model_edit.setReadOnly(True)
+        self._comparison_source_edit = QtWidgets.QLineEdit()
         self._scale_combo = QtWidgets.QComboBox()
 
         self._collision_combo = QtWidgets.QComboBox()
         self._collision_combo.addItem("スキップ", "skip")
         self._collision_combo.addItem("連番で保存", "serial")
+
+        self._sharpen_combo = QtWidgets.QComboBox()
+        self._sharpen_combo.addItem("なし", "none")
+        self._sharpen_combo.addItem("弱", "weak")
+        self._sharpen_combo.addItem("中", "medium")
+        self._sharpen_combo.addItem("強", "strong")
+        self._sharpen_combo.setCurrentIndex(1)
+
+        self._crop_enabled_checkbox = QtWidgets.QCheckBox("中央cropを有効にする")
+        self._crop_ratio_combo = QtWidgets.QComboBox()
+        for ratio_text in CROP_RATIO_CHOICES:
+            self._crop_ratio_combo.addItem(ratio_text, ratio_text)
+        self._crop_ratio_combo.setCurrentText("4:5")
+        self._crop_ratio_combo.setEnabled(False)
 
         self._skip_checkbox = QtWidgets.QCheckBox("既に出力済みのファイルはスキップする")
         self._skip_checkbox.setChecked(True)
@@ -122,10 +142,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._log_view = QtWidgets.QPlainTextEdit()
         self._log_view.setReadOnly(True)
-        self._log_view.setMaximumBlockCount(1500)
+        self._log_view.setMaximumBlockCount(2000)
 
         self._start_button = QtWidgets.QPushButton("一括処理開始")
         self._test_button = QtWidgets.QPushButton("テスト処理（先頭5枚）")
+        self._comparison_button = QtWidgets.QPushButton("1枚比較処理")
         self._stop_button = QtWidgets.QPushButton("停止")
         self._cancel_button = QtWidgets.QPushButton("キャンセル")
         self._stop_button.setEnabled(False)
@@ -144,18 +165,20 @@ class MainWindow(QtWidgets.QMainWindow):
         intro_label.setWordWrap(True)
 
         tips_label = QtWidgets.QLabel(
-            "最初は classical_sr の 2x、PNG 出力、tile size 400、tile overlap 32、"
-            "出力済みスキップ ON、サブフォルダ OFF を推奨します。"
+            "最初は classical_sr の 2x、シャープ弱、PNG 出力、tile size 400、tile overlap 32、"
+            "出力済みスキップ ON、サブフォルダ OFF を推奨します。大量処理前に必ずテスト処理か 1枚比較処理で確認してください。"
         )
         tips_label.setWordWrap(True)
 
         input_button = QtWidgets.QPushButton("参照...")
         output_button = QtWidgets.QPushButton("参照...")
         model_button = QtWidgets.QPushButton("参照...")
+        comparison_button = QtWidgets.QPushButton("参照...")
 
         input_button.clicked.connect(lambda: self._pick_directory(self._input_edit))
         output_button.clicked.connect(lambda: self._pick_directory(self._output_edit))
         model_button.clicked.connect(self._pick_model_file)
+        comparison_button.clicked.connect(self._pick_comparison_file)
 
         form = QtWidgets.QGridLayout()
         form.addWidget(QtWidgets.QLabel("入力フォルダ"), 0, 0)
@@ -169,16 +192,23 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addWidget(model_button, 2, 2)
         form.addWidget(QtWidgets.QLabel("倍率"), 3, 0)
         form.addWidget(self._scale_combo, 3, 1)
-        form.addWidget(QtWidgets.QLabel("同名出力時"), 4, 0)
-        form.addWidget(self._collision_combo, 4, 1)
-        form.addWidget(QtWidgets.QLabel("tile size"), 5, 0)
-        form.addWidget(self._tile_size_spin, 5, 1)
-        form.addWidget(QtWidgets.QLabel("tile overlap"), 6, 0)
-        form.addWidget(self._tile_overlap_spin, 6, 1)
-        form.addWidget(QtWidgets.QLabel("CPU/GPU 状態"), 7, 0)
-        form.addWidget(self._device_label, 7, 1, 1, 2)
-        form.addWidget(QtWidgets.QLabel("判定モデル"), 8, 0)
-        form.addWidget(self._model_info_label, 8, 1, 1, 2)
+        form.addWidget(QtWidgets.QLabel("比較用1枚"), 4, 0)
+        form.addWidget(self._comparison_source_edit, 4, 1)
+        form.addWidget(comparison_button, 4, 2)
+        form.addWidget(QtWidgets.QLabel("同名出力時"), 5, 0)
+        form.addWidget(self._collision_combo, 5, 1)
+        form.addWidget(QtWidgets.QLabel("tile size"), 6, 0)
+        form.addWidget(self._tile_size_spin, 6, 1)
+        form.addWidget(QtWidgets.QLabel("tile overlap"), 7, 0)
+        form.addWidget(self._tile_overlap_spin, 7, 1)
+        form.addWidget(QtWidgets.QLabel("シャープ処理"), 8, 0)
+        form.addWidget(self._sharpen_combo, 8, 1)
+        form.addWidget(self._crop_enabled_checkbox, 9, 0)
+        form.addWidget(self._crop_ratio_combo, 9, 1)
+        form.addWidget(QtWidgets.QLabel("CPU/GPU 状態"), 10, 0)
+        form.addWidget(self._device_label, 10, 1, 1, 2)
+        form.addWidget(QtWidgets.QLabel("判定モデル"), 11, 0)
+        form.addWidget(self._model_info_label, 11, 1, 1, 2)
 
         checkbox_row = QtWidgets.QHBoxLayout()
         checkbox_row.addWidget(self._skip_checkbox)
@@ -188,6 +218,7 @@ class MainWindow(QtWidgets.QMainWindow):
         button_row = QtWidgets.QHBoxLayout()
         button_row.addWidget(self._start_button)
         button_row.addWidget(self._test_button)
+        button_row.addWidget(self._comparison_button)
         button_row.addWidget(self._stop_button)
         button_row.addWidget(self._cancel_button)
         button_row.addStretch(1)
@@ -207,9 +238,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def _connect_signals(self) -> None:
         self._start_button.clicked.connect(lambda: self._start_processing(test_mode=False))
         self._test_button.clicked.connect(lambda: self._start_processing(test_mode=True))
+        self._comparison_button.clicked.connect(self._start_comparison)
         self._stop_button.clicked.connect(self._request_stop)
         self._cancel_button.clicked.connect(self._request_cancel)
         self._scale_combo.currentIndexChanged.connect(self._handle_scale_changed)
+        self._crop_enabled_checkbox.toggled.connect(self._crop_ratio_combo.setEnabled)
 
     def _append_log(self, message: str) -> None:
         self._log_view.appendPlainText(message)
@@ -246,6 +279,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
             self._rebuild_available_models(preferred_path=selected_path, select_scale=scale)
             self._append_log(f"モデルフォルダを再読込しました: {selected_path.parent}")
+
+    def _pick_comparison_file(self) -> None:
+        start_path = self._comparison_source_edit.text().strip()
+        if not start_path:
+            start_path = self._input_edit.text().strip() or str(APP_ROOT)
+        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "比較対象の画像を選択",
+            start_path,
+            SUPPORTED_FILE_FILTER,
+        )
+        if file_path:
+            self._comparison_source_edit.setText(file_path)
 
     def _refresh_runtime_status(self) -> None:
         status = get_runtime_status()
@@ -383,9 +429,10 @@ class MainWindow(QtWidgets.QMainWindow):
             "large": "Large モデル",
             "standard": "標準モデル",
         }
+        compare_ready = "比較処理可" if {2, 4}.issubset(self._preferred_model_by_scale.keys()) else "比較処理は x2/x4 両方必要"
         self._model_info_label.setText(
             f"{label_map.get(descriptor.label, descriptor.label)} / x{descriptor.scale} / "
-            f"{extra_map.get(extra, extra)} / window {descriptor.window_size}"
+            f"{extra_map.get(extra, extra)} / window {descriptor.window_size} / {compare_ready}"
         )
 
     def _selected_scale(self) -> int:
@@ -394,7 +441,13 @@ class MainWindow(QtWidgets.QMainWindow):
             return 2
         return int(current_data)
 
-    def _build_options(self, *, test_mode: bool) -> BatchOptions:
+    def _build_crop_options(self) -> CropOptions:
+        return CropOptions(
+            enabled=self._crop_enabled_checkbox.isChecked(),
+            ratio=str(self._crop_ratio_combo.currentData() or self._crop_ratio_combo.currentText()),
+        )
+
+    def _build_batch_options(self, *, test_mode: bool) -> BatchOptions:
         input_dir = Path(self._input_edit.text().strip())
         output_dir = Path(self._output_edit.text().strip())
         model_path = Path(self._model_edit.text().strip())
@@ -408,9 +461,42 @@ class MainWindow(QtWidgets.QMainWindow):
             skip_existing=self._skip_checkbox.isChecked(),
             recursive=self._recursive_checkbox.isChecked(),
             collision_policy=str(self._collision_combo.currentData()),
+            sharpen_strength=str(self._sharpen_combo.currentData()),
+            crop_options=self._build_crop_options(),
             test_mode=test_mode,
             test_limit=5,
         )
+
+    def _build_comparison_options(self) -> ComparisonOptions:
+        output_dir = Path(self._output_edit.text().strip())
+        input_file = Path(self._comparison_source_edit.text().strip())
+        required_models = {
+            2: self._preferred_model_by_scale[2],
+            4: self._preferred_model_by_scale[4],
+        }
+        return ComparisonOptions(
+            input_file=input_file,
+            output_dir=output_dir,
+            model_paths_by_scale=required_models,
+            tile_size=int(self._tile_size_spin.value()),
+            tile_overlap=int(self._tile_overlap_spin.value()),
+            skip_existing=self._skip_checkbox.isChecked(),
+            collision_policy=str(self._collision_combo.currentData()),
+            crop_options=self._build_crop_options(),
+        )
+
+    def _launch_worker(self, task_callable, start_message: str) -> None:
+        self._append_log(start_message)
+        self._progress_bar.setValue(0)
+        self._current_file_label.setText("現在のファイル: -")
+        self._set_running_state(True)
+
+        self._worker = TaskWorker(task_callable)
+        self._worker.progress_signal.connect(self._handle_progress)
+        self._worker.message_signal.connect(self._append_log)
+        self._worker.finished_signal.connect(self._handle_finished)
+        self._worker.error_signal.connect(self._handle_error)
+        self._worker.start()
 
     def _start_processing(self, *, test_mode: bool) -> None:
         if self._worker and self._worker.isRunning():
@@ -434,7 +520,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return
 
-        options = self._build_options(test_mode=test_mode)
+        options = self._build_batch_options(test_mode=test_mode)
         if not options.input_dir.exists():
             QtWidgets.QMessageBox.warning(self, "入力フォルダ", "入力フォルダが存在しません。")
             return
@@ -446,17 +532,36 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return
 
-        self._append_log("テスト処理を開始します..." if test_mode else "一括処理を開始します...")
-        self._progress_bar.setValue(0)
-        self._current_file_label.setText("現在のファイル: -")
-        self._set_running_state(True)
+        task_callable = partial(run_batch, options)
+        self._launch_worker(
+            task_callable,
+            "テスト処理を開始します..." if test_mode else "一括処理を開始します...",
+        )
 
-        self._worker = BatchWorker(options)
-        self._worker.progress_signal.connect(self._handle_progress)
-        self._worker.message_signal.connect(self._append_log)
-        self._worker.finished_signal.connect(self._handle_finished)
-        self._worker.error_signal.connect(self._handle_error)
-        self._worker.start()
+    def _start_comparison(self) -> None:
+        if self._worker and self._worker.isRunning():
+            return
+
+        if not self._output_edit.text().strip():
+            QtWidgets.QMessageBox.warning(self, "出力フォルダ", "出力フォルダを先に指定してください。")
+            return
+        if not self._comparison_source_edit.text().strip():
+            QtWidgets.QMessageBox.warning(self, "比較用1枚", "比較対象の画像を 1 枚選択してください。")
+            return
+        if 2 not in self._preferred_model_by_scale or 4 not in self._preferred_model_by_scale:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "モデル不足",
+                "1枚比較処理には x2 と x4 の両方の公式モデルが必要です。",
+            )
+            return
+
+        options = self._build_comparison_options()
+        task_callable = partial(run_comparison, options)
+        self._launch_worker(
+            task_callable,
+            "1枚比較処理を開始します。comparison フォルダへ x2/x4 と シャープなし/弱/中 を出力します...",
+        )
 
     def _handle_progress(self, payload: dict) -> None:
         total = max(int(payload.get("total", 0)), 1)
@@ -471,7 +576,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _request_stop(self) -> None:
         if self._worker and self._worker.isRunning():
             self._worker.request_stop()
-            self._append_log("停止要求を受け付けました。現在のファイル完了後に停止します。")
+            self._append_log("停止要求を受け付けました。現在の処理単位完了後に停止します。")
 
     def _request_cancel(self) -> None:
         if self._worker and self._worker.isRunning():
@@ -486,13 +591,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._append_log(
             "処理完了。"
             f" 成功={summary['processed']}, スキップ={summary['skipped']}, 失敗={summary['failed']}, "
-            f"停止={summary['stopped']}, キャンセル={summary['cancelled']}"
+            f"警告={summary.get('warnings', 0)}, 停止={summary['stopped']}, キャンセル={summary['cancelled']}"
         )
         message = (
             f"出力先: {summary['output_dir']}\n"
             f"処理成功: {summary['processed']}\n"
             f"スキップ: {summary['skipped']}\n"
             f"失敗: {summary['failed']}\n"
+            f"警告: {summary.get('warnings', 0)}\n"
             f"停止: {summary['stopped']}\n"
             f"キャンセル: {summary['cancelled']}"
         )
@@ -508,5 +614,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _set_running_state(self, is_running: bool) -> None:
         self._start_button.setEnabled(not is_running)
         self._test_button.setEnabled(not is_running)
+        self._comparison_button.setEnabled(not is_running)
         self._stop_button.setEnabled(is_running)
         self._cancel_button.setEnabled(is_running)
