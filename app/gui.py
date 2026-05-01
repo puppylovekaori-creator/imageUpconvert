@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from functools import partial
 from pathlib import Path
 
@@ -76,6 +76,7 @@ POST_UNSHARP_CHOICES = (
     ("中", "medium"),
     ("強", "strong"),
 )
+PREVIEW_EXPORT_FILTER = "PNG画像 (*.png);;WEBP画像 (*.webp);;JPEG画像 (*.jpg *.jpeg)"
 
 
 class TaskWorker(QtCore.QThread):
@@ -119,16 +120,30 @@ class TaskWorker(QtCore.QThread):
             self.error_signal.emit(str(exc))
 
 
+@dataclass(slots=True)
+class PreviewItem:
+    key: str
+    label: str
+    path: str
+
+
 class PreviewWindow(QtWidgets.QDialog):
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("プレビュー")
         self.resize(1180, 820)
+        self._preview_items: list[PreviewItem] = []
         self._current_path: str = ""
+        self._current_item_key: str = ""
         self._current_pixmap = QtGui.QPixmap()
+        self._source_stem = "preview"
+        self._default_export_dir = APP_ROOT / "comparison"
 
         self._status_label = QtWidgets.QLabel("プレビュー未生成")
         self._status_label.setWordWrap(True)
+        self._save_status_label = QtWidgets.QLabel("")
+        self._save_status_label.setWordWrap(True)
+        self._save_status_label.setStyleSheet("color: #555555;")
 
         self._list_widget = QtWidgets.QListWidget()
         self._list_widget.setMinimumWidth(240)
@@ -139,29 +154,57 @@ class PreviewWindow(QtWidgets.QDialog):
         self._image_label.setMinimumSize(720, 540)
         self._image_label.setStyleSheet("border: 1px solid #c8c8c8; background: #fafafa;")
 
+        self._save_current_button = QtWidgets.QPushButton("表示中を保存")
+        self._save_original_button = QtWidgets.QPushButton("元画像を保存")
+        self._save_comparison_button = QtWidgets.QPushButton("横並び比較を保存")
+        self._save_current_button.clicked.connect(self._save_current_item_via_dialog)
+        self._save_original_button.clicked.connect(self._save_original_item_via_dialog)
+        self._save_comparison_button.clicked.connect(self._save_comparison_via_dialog)
+
         layout = QtWidgets.QVBoxLayout(self)
-        layout.addWidget(self._status_label)
+        header_row = QtWidgets.QHBoxLayout()
+        header_row.addWidget(self._status_label, stretch=1)
+        header_row.addWidget(self._save_current_button)
+        header_row.addWidget(self._save_original_button)
+        header_row.addWidget(self._save_comparison_button)
+        layout.addLayout(header_row)
+        layout.addWidget(self._save_status_label)
 
         content_row = QtWidgets.QHBoxLayout()
         content_row.addWidget(self._list_widget)
         content_row.addWidget(self._image_label, stretch=1)
         layout.addLayout(content_row, stretch=1)
 
-    def set_preview_items(self, items: list[tuple[str, str]]) -> None:
+        self._update_export_buttons()
+
+    def set_export_context(self, *, source_stem: str, default_dir: Path | None) -> None:
+        stem = Path(source_stem).stem.strip() if source_stem else ""
+        self._source_stem = stem or "preview"
+        if default_dir is not None:
+            self._default_export_dir = default_dir
+        else:
+            self._default_export_dir = APP_ROOT / "comparison"
+
+    def set_preview_items(self, items: list[PreviewItem]) -> None:
+        self._preview_items = list(items)
         self._list_widget.clear()
         self._current_path = ""
+        self._current_item_key = ""
         self._current_pixmap = QtGui.QPixmap()
         self._image_label.setText("画像未選択")
         self._image_label.setPixmap(QtGui.QPixmap())
+        self._save_status_label.setText("")
+        self._update_export_buttons()
 
         if not items:
             self._status_label.setText("表示できるプレビュー画像がありません。")
             return
 
         self._status_label.setText(f"クリックで切り替えできます。候補数: {len(items)}")
-        for label, path_text in items:
-            item = QtWidgets.QListWidgetItem(label)
-            item.setData(QtCore.Qt.ItemDataRole.UserRole, path_text)
+        for index, preview in enumerate(items):
+            item = QtWidgets.QListWidgetItem(preview.label)
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, index)
+            item.setToolTip(preview.path)
             self._list_widget.addItem(item)
         self._list_widget.setCurrentRow(0)
 
@@ -173,22 +216,42 @@ class PreviewWindow(QtWidgets.QDialog):
         del previous
         if current is None:
             self._current_path = ""
+            self._current_item_key = ""
             self._current_pixmap = QtGui.QPixmap()
             self._image_label.setText("画像未選択")
             self._image_label.setPixmap(QtGui.QPixmap())
+            self._update_export_buttons()
             return
 
-        path_text = str(current.data(QtCore.Qt.ItemDataRole.UserRole) or "")
-        self._current_path = path_text
-        pixmap = QtGui.QPixmap(path_text)
+        index = int(current.data(QtCore.Qt.ItemDataRole.UserRole) or 0)
+        preview = self._preview_items[index] if 0 <= index < len(self._preview_items) else None
+        if preview is None:
+            self._current_path = ""
+            self._current_item_key = ""
+            self._current_pixmap = QtGui.QPixmap()
+            self._image_label.setText("画像未選択")
+            self._image_label.setPixmap(QtGui.QPixmap())
+            self._update_export_buttons()
+            return
+
+        self._current_path = preview.path
+        self._current_item_key = preview.key
+        pixmap = QtGui.QPixmap(preview.path)
         if pixmap.isNull():
             self._current_pixmap = QtGui.QPixmap()
             self._image_label.setText("読込失敗")
             self._image_label.setPixmap(QtGui.QPixmap())
+            self._status_label.setText(f"読込失敗: {preview.label}")
+            self._update_export_buttons()
             return
 
         self._current_pixmap = pixmap
+        self._status_label.setText(
+            f"クリックで切り替えできます。候補数: {len(self._preview_items)} / "
+            f"現在: {preview.label} ({pixmap.width()}x{pixmap.height()})"
+        )
         self._render_current_pixmap()
+        self._update_export_buttons()
 
     def _render_current_pixmap(self) -> None:
         if self._current_pixmap.isNull():
@@ -206,6 +269,187 @@ class PreviewWindow(QtWidgets.QDialog):
         if not self._current_pixmap.isNull():
             self._render_current_pixmap()
 
+    def _current_item(self) -> PreviewItem | None:
+        if not self._current_item_key:
+            return None
+        return self._find_item(self._current_item_key)
+
+    def _find_item(self, key: str) -> PreviewItem | None:
+        for item in self._preview_items:
+            if item.key == key:
+                return item
+        return None
+
+    def _update_export_buttons(self) -> None:
+        current_item = self._current_item()
+        original_item = self._find_item("original")
+        has_items = bool(self._preview_items)
+        self._save_current_button.setEnabled(current_item is not None)
+        self._save_original_button.setEnabled(original_item is not None)
+        self._save_comparison_button.setEnabled(has_items)
+
+    def _default_export_path(self, suffix: str) -> Path:
+        base_dir = self._default_export_dir if str(self._default_export_dir).strip() else APP_ROOT / "comparison"
+        return base_dir / f"{self._source_stem}_{suffix}.png"
+
+    def _pick_export_path(self, title: str, suggested_path: Path) -> Path | None:
+        suggested_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path, _selected_filter = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            title,
+            str(suggested_path),
+            PREVIEW_EXPORT_FILTER,
+        )
+        if not file_path:
+            return None
+        target_path = Path(file_path)
+        if not target_path.suffix:
+            target_path = target_path.with_suffix(".png")
+        return target_path
+
+    def _save_current_item_via_dialog(self) -> None:
+        current_item = self._current_item()
+        if current_item is None:
+            QtWidgets.QMessageBox.warning(self, "保存", "保存できるプレビュー画像がありません。")
+            return
+        target_path = self._pick_export_path(
+            "表示中プレビューの保存先",
+            self._default_export_path(f"preview_{current_item.key}"),
+        )
+        if target_path is None:
+            return
+        try:
+            saved_path = self._export_item_image(current_item, target_path)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "保存エラー", str(exc))
+            return
+        self._save_status_label.setText(f"表示中プレビューを保存しました: {saved_path}")
+
+    def _save_original_item_via_dialog(self) -> None:
+        original_item = self._find_item("original")
+        if original_item is None:
+            QtWidgets.QMessageBox.warning(self, "保存", "元画像プレビューがありません。")
+            return
+        target_path = self._pick_export_path(
+            "元画像プレビューの保存先",
+            self._default_export_path("preview_original"),
+        )
+        if target_path is None:
+            return
+        try:
+            saved_path = self._export_item_image(original_item, target_path)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "保存エラー", str(exc))
+            return
+        self._save_status_label.setText(f"元画像プレビューを保存しました: {saved_path}")
+
+    def _save_comparison_via_dialog(self) -> None:
+        target_path = self._pick_export_path(
+            "横並び比較画像の保存先",
+            self._default_export_path("preview_strip"),
+        )
+        if target_path is None:
+            return
+        try:
+            saved_path = self._export_comparison_image(target_path)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "保存エラー", str(exc))
+            return
+        self._save_status_label.setText(f"横並び比較画像を保存しました: {saved_path}")
+
+    def _export_item_image(self, preview_item: PreviewItem, target_path: Path) -> Path:
+        source_path = Path(preview_item.path)
+        if not source_path.exists():
+            raise FileNotFoundError(f"保存元のプレビュー画像が見つかりません: {source_path}")
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        if source_path.resolve(strict=False) == target_path.resolve(strict=False):
+            raise ValueError("保存先がプレビュー画像と同じです。別の場所を指定してください。")
+        image = QtGui.QImage(str(source_path))
+        if image.isNull():
+            raise ValueError(f"プレビュー画像を読めませんでした: {source_path}")
+        if not image.save(str(target_path)):
+            raise ValueError(f"画像保存に失敗しました: {target_path}")
+        return target_path
+
+    def _export_comparison_image(self, target_path: Path) -> Path:
+        comparison_image = self._build_comparison_image()
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        if not comparison_image.save(str(target_path)):
+            raise ValueError(f"横並び比較画像の保存に失敗しました: {target_path}")
+        return target_path
+
+    def _build_comparison_image(self) -> QtGui.QImage:
+        loaded_items: list[tuple[PreviewItem, QtGui.QImage]] = []
+        for item in self._preview_items:
+            path = Path(item.path)
+            if not path.exists():
+                continue
+            image = QtGui.QImage(str(path))
+            if image.isNull():
+                continue
+            loaded_items.append((item, image))
+        if not loaded_items:
+            raise ValueError("横並び保存できるプレビュー画像がありません。")
+
+        target_height = min(max(image.height() for _item, image in loaded_items), 720)
+        target_height = max(target_height, 200)
+        header_height = 60
+        padding = 20
+        spacing = 18
+
+        scaled_images = [
+            image.scaledToHeight(
+                target_height,
+                QtCore.Qt.TransformationMode.SmoothTransformation,
+            )
+            for _item, image in loaded_items
+        ]
+        total_width = padding * 2 + sum(image.width() for image in scaled_images)
+        total_width += spacing * max(len(scaled_images) - 1, 0)
+        total_height = padding * 2 + header_height + target_height
+
+        canvas = QtGui.QImage(total_width, total_height, QtGui.QImage.Format.Format_ARGB32)
+        canvas.fill(QtGui.QColor("#ffffff"))
+        painter = QtGui.QPainter(canvas)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.TextAntialiasing, True)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform, True)
+
+        label_font = painter.font()
+        label_font.setPointSize(11)
+        label_font.setBold(True)
+        size_font = QtGui.QFont(label_font)
+        size_font.setPointSize(9)
+        size_font.setBold(False)
+
+        current_x = padding
+        for (item, original_image), scaled_image in zip(loaded_items, scaled_images):
+            header_rect = QtCore.QRect(current_x, padding, scaled_image.width(), header_height - 8)
+            painter.setPen(QtGui.QColor("#222222"))
+            painter.setFont(label_font)
+            painter.drawText(
+                header_rect,
+                QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop | QtCore.Qt.TextFlag.TextWordWrap,
+                item.label,
+            )
+            painter.setFont(size_font)
+            painter.setPen(QtGui.QColor("#666666"))
+            size_rect = QtCore.QRect(current_x, padding + 26, scaled_image.width(), header_height - 8)
+            painter.drawText(
+                size_rect,
+                QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop,
+                f"{original_image.width()}x{original_image.height()}",
+            )
+            image_rect = QtCore.QRect(current_x, padding + header_height, scaled_image.width(), scaled_image.height())
+            painter.fillRect(image_rect, QtGui.QColor("#f6f6f6"))
+            painter.drawImage(image_rect.topLeft(), scaled_image)
+            painter.setPen(QtGui.QColor("#d0d0d0"))
+            painter.drawRect(image_rect)
+            current_x += scaled_image.width() + spacing
+
+        painter.end()
+        return canvas
+
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
@@ -215,7 +459,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._worker: TaskWorker | None = None
         self._available_scales = list_available_internal_scales()
         self._preview_window = PreviewWindow(self)
-        self._latest_preview_items: list[tuple[str, str]] = []
+        self._latest_preview_items: list[PreviewItem] = []
 
         self._gimp_path_edit = QtWidgets.QLineEdit()
         self._input_edit = QtWidgets.QLineEdit()
@@ -919,7 +1163,19 @@ class MainWindow(QtWidgets.QMainWindow):
         for key in ("original", "gimp_pre", "swinir", "post"):
             path_text = str(payload.get(f"{key}_preview_path", "") or "")
             if path_text:
-                self._latest_preview_items.append((labels.get(key, key), path_text))
+                self._latest_preview_items.append(
+                    PreviewItem(
+                        key=key,
+                        label=labels.get(key, key),
+                        path=path_text,
+                    )
+                )
+        output_dir_text = self._output_edit.text().strip()
+        default_export_dir = Path(output_dir_text) / "comparison" if output_dir_text else APP_ROOT / "comparison"
+        self._preview_window.set_export_context(
+            source_stem=Path(str(payload.get("input_file", "preview"))).stem,
+            default_dir=default_export_dir,
+        )
         self._preview_window.set_preview_items(self._latest_preview_items)
         self._preview_window.show()
         self._preview_window.raise_()
