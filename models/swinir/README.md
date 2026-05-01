@@ -1,6 +1,9 @@
 # SwinIR Models
 
-Place official SwinIR pretrained `.pth` files from the upstream release here.
+This folder stores official SwinIR pretrained `.pth` files used by the GUI.
+
+`setup.bat` downloads the GUI-supported official `2x / 4x` models here automatically.
+If you need to fetch them again manually, run `download_models.bat`.
 
 Recommended first model for low-invasive person-photo upscaling:
 

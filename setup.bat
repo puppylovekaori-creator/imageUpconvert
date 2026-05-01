@@ -52,14 +52,18 @@ echo Installing timm after torch so pip does not choose a PyTorch build automati
 if errorlevel 1 goto :pip_error
 
 echo.
+echo Downloading official SwinIR models for the GUI-supported 2x and 4x modes...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%CD%\tools\download_models.ps1"
+if errorlevel 1 goto :pip_error
+
+echo.
 echo Environment check:
 "%VENV_PYTHON%" -m app.env_check
 
 echo.
 echo Setup completed.
 echo Next steps:
-echo 1. Put an official SwinIR .pth model into models\swinir\
-echo 2. Double-click run_gui.bat
+echo 1. Double-click run_gui.bat
 echo.
 echo venv location:
 echo %VENV_DIR%

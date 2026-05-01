@@ -101,6 +101,7 @@
 - `%LOCALAPPDATA%\imageUpconvert\venv` に venv 作成
 - `requirements.txt` インストール
 - CPU 版 PyTorch の最小構成インストール
+- GUI が使う公式 SwinIR の `2x / 4x` モデルをダウンロード
 - 簡易環境確認
 
 注意:
@@ -108,21 +109,16 @@
 - `setup.bat` は GPU 版 PyTorch を無理に自動判定しません
 - 最初は CPU で確実に動くことを優先しています
 
-### 3. 公式学習済みモデルを置く
-
-`models/swinir/` に、**SwinIR 公式リリースの `.pth`** を置いてください。
-
-公式:
-
-- https://github.com/JingyunLiang/SwinIR/releases
-
-ファイル名は変更せず、そのまま置いてください。GUI は公式ファイル名からモデル種別を判定します。
-
-### 4. `run_gui.bat` を実行する
+### 3. `run_gui.bat` を実行する
 
 起動は **`run_gui.bat` のダブルクリック** です。
 
 このバッチは `%LOCALAPPDATA%\imageUpconvert\venv` の Python を使って GUI を起動します。
+
+補足:
+
+- `setup.bat` は GUI が扱う公式 `2x / 4x` モデルを `models/swinir/` へ自動ダウンロードします
+- もう一度モデルだけ取り直したい場合は `download_models.bat` を実行してください
 
 ## GPU を使いたい場合
 
@@ -223,6 +219,7 @@ output/
 failed/
 requirements.txt
 setup.bat
+download_models.bat
 run_gui.bat
 README.md
 ```
