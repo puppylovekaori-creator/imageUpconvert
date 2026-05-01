@@ -98,6 +98,13 @@ def load_swinir_network_class():
     return module.SwinIR
 
 
+def detect_model_scale_from_filename(model_path: Path) -> int | None:
+    scale_match = re.search(r"_x(\d+)(?:[_\.]|$)", model_path.name.lower())
+    if not scale_match:
+        return None
+    return int(scale_match.group(1))
+
+
 def infer_model_descriptor(model_path: Path, requested_scale: int) -> ModelDescriptor:
     name = model_path.name.lower()
 
@@ -122,8 +129,9 @@ def infer_model_descriptor(model_path: Path, requested_scale: int) -> ModelDescr
             " 001_classicalSR_... や 003_realSR_... のような公式ファイル名を使ってください。"
         )
 
-    scale_match = re.search(r"_x(\d+)(?:[_\.]|$)", name)
-    detected_scale = int(scale_match.group(1)) if scale_match else (4 if task == "real_sr" else requested_scale)
+    detected_scale = detect_model_scale_from_filename(model_path)
+    if detected_scale is None:
+        detected_scale = 4 if task == "real_sr" else requested_scale
     if requested_scale != detected_scale:
         raise ValueError(
             f"選択した倍率 x{requested_scale} と、モデル名から判定した倍率 x{detected_scale} が一致しません。"

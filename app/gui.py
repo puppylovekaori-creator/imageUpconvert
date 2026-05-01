@@ -6,7 +6,13 @@ from pathlib import Path
 from PySide6 import QtCore, QtWidgets
 
 from .env_check import format_runtime_status, get_runtime_status
-from .swinir_runner import BatchOptions, InterruptController, infer_model_descriptor, run_batch
+from .swinir_runner import (
+    BatchOptions,
+    InterruptController,
+    detect_model_scale_from_filename,
+    infer_model_descriptor,
+    run_batch,
+)
 
 
 APP_ROOT = Path(__file__).resolve().parent.parent
@@ -184,7 +190,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._test_button.clicked.connect(lambda: self._start_processing(test_mode=True))
         self._stop_button.clicked.connect(self._request_stop)
         self._cancel_button.clicked.connect(self._request_cancel)
-        self._model_edit.textChanged.connect(self._refresh_model_info)
+        self._model_edit.textChanged.connect(self._handle_model_path_changed)
         self._scale_combo.currentIndexChanged.connect(self._refresh_model_info)
 
     def _append_log(self, message: str) -> None:
@@ -211,10 +217,45 @@ class MainWindow(QtWidgets.QMainWindow):
         status = get_runtime_status()
         self._device_label.setText(format_runtime_status(status))
 
+    def _set_selected_scale(self, scale: int) -> None:
+        index = self._scale_combo.findData(scale)
+        if index < 0 or index == self._scale_combo.currentIndex():
+            return
+        blocker = QtCore.QSignalBlocker(self._scale_combo)
+        self._scale_combo.setCurrentIndex(index)
+        del blocker
+
+    def _sync_scale_with_model_path(self, *, log_change: bool) -> bool:
+        model_text = self._model_edit.text().strip()
+        if not model_text:
+            return False
+
+        detected_scale = detect_model_scale_from_filename(Path(model_text))
+        if detected_scale not in {2, 4}:
+            return False
+        if detected_scale == self._selected_scale():
+            return False
+
+        self._set_selected_scale(detected_scale)
+        if log_change:
+            self._append_log(f"モデル名から倍率 x{detected_scale} を検出したため、倍率を自動調整しました。")
+        return True
+
+    def _handle_model_path_changed(self) -> None:
+        self._sync_scale_with_model_path(log_change=False)
+        self._refresh_model_info()
+
     def _refresh_model_info(self) -> None:
         model_text = self._model_edit.text().strip()
         if not model_text:
             self._model_info_label.setText("公式 SwinIR の .pth モデルを選択してください。")
+            return
+
+        detected_scale = detect_model_scale_from_filename(Path(model_text))
+        if detected_scale in {2, 4} and detected_scale != self._selected_scale():
+            self._model_info_label.setText(
+                f"モデル名から x{detected_scale} を検出しました。開始時に倍率を x{detected_scale} へ自動調整します。"
+            )
             return
 
         try:
@@ -273,6 +314,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 "入力フォルダ、出力フォルダ、モデルファイルはすべて必須です。",
             )
             return
+
+        self._sync_scale_with_model_path(log_change=True)
+        self._refresh_model_info()
 
         options = self._build_options(test_mode=test_mode)
         if not options.input_dir.exists():
