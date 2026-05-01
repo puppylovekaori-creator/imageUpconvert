@@ -58,7 +58,7 @@ class BatchWorker(QtCore.QThread):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("SwinIR Image Upconvert GUI")
+        self.setWindowTitle("SwinIR 画像高解像度化 GUI")
         self.resize(980, 720)
         self._worker: BatchWorker | None = None
 
@@ -71,26 +71,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self._scale_combo.setCurrentIndex(0)
 
         self._collision_combo = QtWidgets.QComboBox()
-        self._collision_combo.addItem("Skip", "skip")
-        self._collision_combo.addItem("Serial", "serial")
+        self._collision_combo.addItem("スキップ", "skip")
+        self._collision_combo.addItem("連番で保存", "serial")
 
-        self._skip_checkbox = QtWidgets.QCheckBox("Skip files that already have outputs")
+        self._skip_checkbox = QtWidgets.QCheckBox("既に出力済みのファイルはスキップする")
         self._skip_checkbox.setChecked(True)
-        self._recursive_checkbox = QtWidgets.QCheckBox("Process subfolders too")
+        self._recursive_checkbox = QtWidgets.QCheckBox("サブフォルダも処理する")
         self._recursive_checkbox.setChecked(False)
 
         self._tile_size_spin = QtWidgets.QSpinBox()
         self._tile_size_spin.setRange(0, 8192)
         self._tile_size_spin.setValue(400)
-        self._tile_size_spin.setToolTip("0 disables tiling. Keep 400 as the first default.")
+        self._tile_size_spin.setToolTip("0 を指定するとタイル分割を無効化します。まずは 400 を推奨します。")
 
         self._tile_overlap_spin = QtWidgets.QSpinBox()
         self._tile_overlap_spin.setRange(0, 1024)
         self._tile_overlap_spin.setValue(32)
 
         self._device_label = QtWidgets.QLabel()
-        self._model_info_label = QtWidgets.QLabel("No model selected.")
-        self._current_file_label = QtWidgets.QLabel("Current file: -")
+        self._model_info_label = QtWidgets.QLabel("モデル未選択です。")
+        self._current_file_label = QtWidgets.QLabel("現在のファイル: -")
         self._progress_bar = QtWidgets.QProgressBar()
         self._progress_bar.setRange(0, 100)
         self._progress_bar.setValue(0)
@@ -99,10 +99,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._log_view.setReadOnly(True)
         self._log_view.setMaximumBlockCount(1500)
 
-        self._start_button = QtWidgets.QPushButton("Start")
-        self._test_button = QtWidgets.QPushButton("Test process (5 files)")
-        self._stop_button = QtWidgets.QPushButton("Stop")
-        self._cancel_button = QtWidgets.QPushButton("Cancel")
+        self._start_button = QtWidgets.QPushButton("一括処理開始")
+        self._test_button = QtWidgets.QPushButton("テスト処理（先頭5枚）")
+        self._stop_button = QtWidgets.QPushButton("停止")
+        self._cancel_button = QtWidgets.QPushButton("キャンセル")
         self._stop_button.setEnabled(False)
         self._cancel_button.setEnabled(False)
 
@@ -113,46 +113,46 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _build_ui(self) -> None:
         intro_label = QtWidgets.QLabel(
-            "Low-invasive super-resolution only. "
-            "No face enhancement, no generation, no Stable Diffusion, no GFPGAN, no CodeFormer."
+            "このツールは低侵襲な高解像度化専用です。"
+            " 顔補正、生成補完、Stable Diffusion、GFPGAN、CodeFormer は使いません。"
         )
         intro_label.setWordWrap(True)
 
         tips_label = QtWidgets.QLabel(
-            "Recommended first pass: classical_sr x2, PNG output, tile size 400, overlap 32, "
-            "skip existing ON, recursive OFF."
+            "最初は classical_sr の 2x、PNG 出力、tile size 400、tile overlap 32、"
+            "出力済みスキップ ON、サブフォルダ OFF を推奨します。"
         )
         tips_label.setWordWrap(True)
 
-        input_button = QtWidgets.QPushButton("Browse...")
-        output_button = QtWidgets.QPushButton("Browse...")
-        model_button = QtWidgets.QPushButton("Browse...")
+        input_button = QtWidgets.QPushButton("参照...")
+        output_button = QtWidgets.QPushButton("参照...")
+        model_button = QtWidgets.QPushButton("参照...")
 
         input_button.clicked.connect(lambda: self._pick_directory(self._input_edit))
         output_button.clicked.connect(lambda: self._pick_directory(self._output_edit))
         model_button.clicked.connect(self._pick_model_file)
 
         form = QtWidgets.QGridLayout()
-        form.addWidget(QtWidgets.QLabel("Input folder"), 0, 0)
+        form.addWidget(QtWidgets.QLabel("入力フォルダ"), 0, 0)
         form.addWidget(self._input_edit, 0, 1)
         form.addWidget(input_button, 0, 2)
-        form.addWidget(QtWidgets.QLabel("Output folder"), 1, 0)
+        form.addWidget(QtWidgets.QLabel("出力フォルダ"), 1, 0)
         form.addWidget(self._output_edit, 1, 1)
         form.addWidget(output_button, 1, 2)
-        form.addWidget(QtWidgets.QLabel("Model file"), 2, 0)
+        form.addWidget(QtWidgets.QLabel("モデルファイル"), 2, 0)
         form.addWidget(self._model_edit, 2, 1)
         form.addWidget(model_button, 2, 2)
-        form.addWidget(QtWidgets.QLabel("Scale"), 3, 0)
+        form.addWidget(QtWidgets.QLabel("倍率"), 3, 0)
         form.addWidget(self._scale_combo, 3, 1)
-        form.addWidget(QtWidgets.QLabel("If output exists"), 4, 0)
+        form.addWidget(QtWidgets.QLabel("同名出力時"), 4, 0)
         form.addWidget(self._collision_combo, 4, 1)
-        form.addWidget(QtWidgets.QLabel("Tile size"), 5, 0)
+        form.addWidget(QtWidgets.QLabel("tile size"), 5, 0)
         form.addWidget(self._tile_size_spin, 5, 1)
-        form.addWidget(QtWidgets.QLabel("Tile overlap"), 6, 0)
+        form.addWidget(QtWidgets.QLabel("tile overlap"), 6, 0)
         form.addWidget(self._tile_overlap_spin, 6, 1)
-        form.addWidget(QtWidgets.QLabel("Device status"), 7, 0)
+        form.addWidget(QtWidgets.QLabel("CPU/GPU 状態"), 7, 0)
         form.addWidget(self._device_label, 7, 1, 1, 2)
-        form.addWidget(QtWidgets.QLabel("Detected model"), 8, 0)
+        form.addWidget(QtWidgets.QLabel("判定モデル"), 8, 0)
         form.addWidget(self._model_info_label, 8, 1, 1, 2)
 
         checkbox_row = QtWidgets.QHBoxLayout()
@@ -192,7 +192,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _pick_directory(self, target_edit: QtWidgets.QLineEdit) -> None:
         start_dir = target_edit.text().strip() or str(APP_ROOT)
-        selected = QtWidgets.QFileDialog.getExistingDirectory(self, "Select folder", start_dir)
+        selected = QtWidgets.QFileDialog.getExistingDirectory(self, "フォルダを選択", start_dir)
         if selected:
             target_edit.setText(selected)
 
@@ -200,9 +200,9 @@ class MainWindow(QtWidgets.QMainWindow):
         start_path = self._model_edit.text().strip() or str(DEFAULT_MODEL_PATH.parent)
         file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
-            "Select SwinIR model",
+            "SwinIR モデルを選択",
             start_path,
-            "PyTorch model (*.pth *.pt);;All files (*.*)",
+            "PyTorch モデル (*.pth *.pt);;すべてのファイル (*.*)",
         )
         if file_path:
             self._model_edit.setText(file_path)
@@ -214,18 +214,28 @@ class MainWindow(QtWidgets.QMainWindow):
     def _refresh_model_info(self) -> None:
         model_text = self._model_edit.text().strip()
         if not model_text:
-            self._model_info_label.setText("Select an official SwinIR .pth model file.")
+            self._model_info_label.setText("公式 SwinIR の .pth モデルを選択してください。")
             return
 
         try:
             descriptor = infer_model_descriptor(Path(model_text), self._selected_scale())
         except Exception as exc:
-            self._model_info_label.setText(f"Model check: {exc}")
+            self._model_info_label.setText(f"モデル確認: {exc}")
             return
 
+        label_map = {
+            "classical_sr": "classical_sr（素直な拡大向け）",
+            "lightweight_sr": "lightweight_sr（軽量）",
+            "real_sr": "real_sr（比較用）",
+        }
         extra = "large" if descriptor.large_model else "standard"
+        extra_map = {
+            "large": "Large モデル",
+            "standard": "標準モデル",
+        }
         self._model_info_label.setText(
-            f"{descriptor.label} / x{descriptor.scale} / {extra} / window {descriptor.window_size}"
+            f"{label_map.get(descriptor.label, descriptor.label)} / x{descriptor.scale} / "
+            f"{extra_map.get(extra, extra)} / window {descriptor.window_size}"
         )
 
     def _selected_scale(self) -> int:
@@ -259,26 +269,26 @@ class MainWindow(QtWidgets.QMainWindow):
         if not input_text or not output_text or not model_text:
             QtWidgets.QMessageBox.warning(
                 self,
-                "Missing settings",
-                "Input folder, output folder, and model file are all required.",
+                "設定不足",
+                "入力フォルダ、出力フォルダ、モデルファイルはすべて必須です。",
             )
             return
 
         options = self._build_options(test_mode=test_mode)
         if not options.input_dir.exists():
-            QtWidgets.QMessageBox.warning(self, "Input folder", "Input folder does not exist.")
+            QtWidgets.QMessageBox.warning(self, "入力フォルダ", "入力フォルダが存在しません。")
             return
         if options.input_dir.resolve() == options.output_dir.resolve():
             QtWidgets.QMessageBox.warning(
                 self,
-                "Output folder",
-                "Output folder must not be the same as the input folder.",
+                "出力フォルダ",
+                "出力フォルダは入力フォルダと同じ場所にできません。",
             )
             return
 
-        self._append_log("Starting test run..." if test_mode else "Starting batch run...")
+        self._append_log("テスト処理を開始します..." if test_mode else "一括処理を開始します...")
         self._progress_bar.setValue(0)
-        self._current_file_label.setText("Current file: -")
+        self._current_file_label.setText("現在のファイル: -")
         self._set_running_state(True)
 
         self._worker = BatchWorker(options)
@@ -293,7 +303,7 @@ class MainWindow(QtWidgets.QMainWindow):
         completed = int(payload.get("completed", 0))
         path_text = payload.get("path", "")
         if path_text:
-            self._current_file_label.setText(f"Current file: {path_text}")
+            self._current_file_label.setText(f"現在のファイル: {path_text}")
 
         percentage = int((completed / total) * 100)
         self._progress_bar.setValue(min(max(percentage, 0), 100))
@@ -301,12 +311,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def _request_stop(self) -> None:
         if self._worker and self._worker.isRunning():
             self._worker.request_stop()
-            self._append_log("Stop requested. The current file will finish first.")
+            self._append_log("停止要求を受け付けました。現在のファイル完了後に停止します。")
 
     def _request_cancel(self) -> None:
         if self._worker and self._worker.isRunning():
             self._worker.request_cancel()
-            self._append_log("Cancel requested. The run will stop as soon as possible.")
+            self._append_log("キャンセル要求を受け付けました。できるだけ早く中断します。")
 
     def _handle_finished(self, summary: dict) -> None:
         self._set_running_state(False)
@@ -314,25 +324,25 @@ class MainWindow(QtWidgets.QMainWindow):
         completed = int(summary.get("processed", 0)) + int(summary.get("skipped", 0)) + int(summary.get("failed", 0))
         self._progress_bar.setValue(int((completed / total) * 100))
         self._append_log(
-            "Finished. "
-            f"processed={summary['processed']}, skipped={summary['skipped']}, failed={summary['failed']}, "
-            f"stopped={summary['stopped']}, cancelled={summary['cancelled']}"
+            "処理完了。"
+            f" 成功={summary['processed']}, スキップ={summary['skipped']}, 失敗={summary['failed']}, "
+            f"停止={summary['stopped']}, キャンセル={summary['cancelled']}"
         )
         message = (
-            f"Output folder: {summary['output_dir']}\n"
-            f"Processed: {summary['processed']}\n"
-            f"Skipped: {summary['skipped']}\n"
-            f"Failed: {summary['failed']}\n"
-            f"Stopped: {summary['stopped']}\n"
-            f"Cancelled: {summary['cancelled']}"
+            f"出力先: {summary['output_dir']}\n"
+            f"処理成功: {summary['processed']}\n"
+            f"スキップ: {summary['skipped']}\n"
+            f"失敗: {summary['failed']}\n"
+            f"停止: {summary['stopped']}\n"
+            f"キャンセル: {summary['cancelled']}"
         )
-        QtWidgets.QMessageBox.information(self, "Run finished", message)
+        QtWidgets.QMessageBox.information(self, "処理完了", message)
         self._worker = None
 
     def _handle_error(self, message: str) -> None:
         self._set_running_state(False)
-        self._append_log(f"Error: {message}")
-        QtWidgets.QMessageBox.critical(self, "Run error", message)
+        self._append_log(f"エラー: {message}")
+        QtWidgets.QMessageBox.critical(self, "処理エラー", message)
         self._worker = None
 
     def _set_running_state(self, is_running: bool) -> None:

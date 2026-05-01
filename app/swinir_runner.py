@@ -82,7 +82,7 @@ class InterruptController:
 
     def raise_if_cancelled(self) -> None:
         if self._is_cancel_requested():
-            raise UserCancelledError("Processing was cancelled by the user.")
+            raise UserCancelledError("ユーザー操作によりキャンセルされました。")
 
     def should_stop(self) -> bool:
         return self._is_stop_requested()
@@ -118,19 +118,19 @@ def infer_model_descriptor(model_path: Path, requested_scale: int) -> ModelDescr
         label = "real_sr"
     else:
         raise ValueError(
-            "Unable to detect the official SwinIR model type from the filename. "
-            "Use an official filename such as 001_classicalSR_... or 003_realSR_...."
+            "ファイル名から公式 SwinIR モデル種別を判定できませんでした。"
+            " 001_classicalSR_... や 003_realSR_... のような公式ファイル名を使ってください。"
         )
 
     scale_match = re.search(r"_x(\d+)(?:[_\.]|$)", name)
     detected_scale = int(scale_match.group(1)) if scale_match else (4 if task == "real_sr" else requested_scale)
     if requested_scale != detected_scale:
         raise ValueError(
-            f"The selected scale x{requested_scale} does not match the model filename scale x{detected_scale}."
+            f"選択した倍率 x{requested_scale} と、モデル名から判定した倍率 x{detected_scale} が一致しません。"
         )
 
     if task == "real_sr" and requested_scale != 4:
-        raise ValueError("The official real_sr models bundled in SwinIR are x4 only.")
+        raise ValueError("公式の real_sr モデルは x4 のみ対応です。")
 
     return ModelDescriptor(
         task=task,
@@ -145,7 +145,7 @@ def infer_model_descriptor(model_path: Path, requested_scale: int) -> ModelDescr
 def ensure_torch_available() -> None:
     if TORCH_IMPORT_ERROR is not None or torch is None:
         raise RuntimeError(
-            "PyTorch is not available. Run setup.bat first, or install torch inside venv."
+            "PyTorch を利用できません。setup.bat を先に実行するか、venv に torch をインストールしてください。"
         ) from TORCH_IMPORT_ERROR
 
 
@@ -220,7 +220,7 @@ def define_model(descriptor: ModelDescriptor, model_path: Path, device: Any):
             )
         param_key = "params_ema"
     else:
-        raise ValueError(f"Unsupported model task: {descriptor.task}")
+        raise ValueError(f"未対応のモデル種別です: {descriptor.task}")
 
     checkpoint = load_checkpoint(model_path, device)
     state_dict = checkpoint[param_key] if param_key in checkpoint else checkpoint
@@ -231,19 +231,19 @@ def define_model(descriptor: ModelDescriptor, model_path: Path, device: Any):
 
 def validate_options(options: BatchOptions) -> None:
     if not options.input_dir.exists() or not options.input_dir.is_dir():
-        raise ValueError("Input folder does not exist.")
+        raise ValueError("入力フォルダが存在しません。")
     if not options.model_path.exists() or not options.model_path.is_file():
-        raise ValueError("Model file does not exist.")
+        raise ValueError("モデルファイルが存在しません。")
     if options.scale not in {2, 4}:
-        raise ValueError("Scale must be either 2 or 4.")
+        raise ValueError("倍率は 2 または 4 を選んでください。")
     if options.tile_size < 0 or options.tile_overlap < 0:
-        raise ValueError("Tile size and tile overlap must be zero or greater.")
+        raise ValueError("tile size と tile overlap は 0 以上で指定してください。")
 
     input_resolved = options.input_dir.resolve()
     output_resolved = options.output_dir.resolve()
     if input_resolved == output_resolved or input_resolved in output_resolved.parents:
         raise ValueError(
-            "Output folder must be different from the input folder and must not be inside the input folder."
+            "出力フォルダは入力フォルダと別にしてください。入力フォルダの内側も指定できません。"
         )
 
 
@@ -402,12 +402,12 @@ def run_batch(
     if options.test_mode:
         files = files[: options.test_limit]
     if not files:
-        raise ValueError("No supported image files were found in the input folder.")
+        raise ValueError("入力フォルダ内に対応画像が見つかりませんでした。")
 
-    message_callback(f"Detected model type: {descriptor.label}")
-    message_callback(f"Output folder: {output_dir}")
+    message_callback(f"検出モデル: {descriptor.label}")
+    message_callback(f"出力先: {output_dir}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    message_callback(f"Using device: {device}")
+    message_callback(f"使用デバイス: {device}")
     model = define_model(descriptor, options.model_path, device)
 
     summary = RunSummary(
@@ -427,7 +427,7 @@ def run_batch(
             controller.raise_if_cancelled()
             if controller.should_stop():
                 summary.stopped = True
-                message_callback("Stop requested. No new files will be started.")
+                message_callback("停止要求を受け付けました。現在のファイル完了後、新しいファイルは開始しません。")
                 break
 
             progress_callback(
@@ -463,7 +463,7 @@ def run_batch(
                     tile_overlap=options.tile_overlap,
                     alpha_present="",
                     result="skipped",
-                    error_message="Skipped because an output file already exists.",
+                    error_message="同名の出力ファイルが既にあるためスキップしました。",
                     elapsed_seconds=time.perf_counter() - started_at,
                 )
                 logger.log_processing(row)
@@ -513,7 +513,7 @@ def run_batch(
                 )
                 logger.log_processing(row)
                 summary.processed += 1
-                message_callback(f"Processed: {input_path.name}")
+                message_callback(f"処理完了: {input_path.name}")
                 progress_callback(
                     {
                         "phase": "finished",
@@ -545,7 +545,7 @@ def run_batch(
                 logger.log_processing(row)
                 logger.log_failed(row)
                 summary.failed += 1
-                message_callback(f"Failed: {input_path.name} -> {exc}")
+                message_callback(f"失敗: {input_path.name} -> {exc}")
                 progress_callback(
                     {
                         "phase": "finished",
@@ -557,7 +557,7 @@ def run_batch(
                 )
     except UserCancelledError:
         summary.cancelled = True
-        message_callback("Processing cancelled by the user.")
+        message_callback("キャンセルされました。処理を中断しました。")
     finally:
         logger.close()
 
@@ -565,7 +565,7 @@ def run_batch(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run SwinIR batch processing without the GUI.")
+    parser = argparse.ArgumentParser(description="GUI を使わずに SwinIR の一括処理を実行します。")
     parser.add_argument("--input-dir", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--model-path", required=True, type=Path)

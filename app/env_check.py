@@ -31,13 +31,13 @@ def get_runtime_status() -> RuntimeStatus:
         cuda_available=False,
         cuda_device_name="",
         cuda_device_count=0,
-        message="PyTorch is not installed.",
+        message="PyTorch がインストールされていません。",
     )
 
     try:
         import torch
     except Exception as exc:  # pragma: no cover - depends on local runtime
-        base.message = f"PyTorch import failed: {exc}"
+        base.message = f"PyTorch の読み込みに失敗しました: {exc}"
         return base
 
     cuda_available = torch.cuda.is_available()
@@ -48,7 +48,7 @@ def get_runtime_status() -> RuntimeStatus:
         cuda_device_name = torch.cuda.get_device_name(0)
 
     message = (
-        f"PyTorch {torch.__version__} / CUDA {'available' if cuda_available else 'not available'}"
+        f"PyTorch {torch.__version__} / CUDA {'利用可' if cuda_available else '利用不可'}"
     )
     if cuda_device_name:
         message += f" / {cuda_device_name}"
@@ -67,18 +67,18 @@ def get_runtime_status() -> RuntimeStatus:
 
 
 def format_runtime_status(status: RuntimeStatus) -> str:
-    device_text = "GPU available" if status.cuda_available else "CPU only"
+    device_text = "GPU 利用可" if status.cuda_available else "CPU のみ"
     if status.cuda_device_name:
         device_text += f" ({status.cuda_device_name})"
     return (
         f"Python {status.python_version} | "
-        f"PyTorch {status.torch_version or 'not installed'} | {device_text}"
+        f"PyTorch {status.torch_version or '未導入'} | {device_text}"
     )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--json", action="store_true", help="Emit JSON instead of plain text.")
+    parser.add_argument("--json", action="store_true", help="標準テキストではなく JSON を出力します。")
     args = parser.parse_args()
 
     status = get_runtime_status()
@@ -86,8 +86,8 @@ def main() -> int:
         print(json.dumps(asdict(status), ensure_ascii=False, indent=2))
     else:
         print(status.message)
-        print(f"Python: {status.python_executable}")
-        print(f"Platform: {status.platform}")
+        print(f"Python 実行ファイル: {status.python_executable}")
+        print(f"プラットフォーム: {status.platform}")
     return 0
 
 
