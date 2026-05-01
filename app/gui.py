@@ -106,6 +106,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self._progress_bar = QtWidgets.QProgressBar()
         self._progress_bar.setRange(0, 100)
         self._progress_bar.setValue(0)
+        self._progress_bar.setFixedHeight(24)
+        self._progress_bar.setStyleSheet(
+            "QProgressBar {"
+            " border: 1px solid #9a9a9a;"
+            " border-radius: 4px;"
+            " text-align: center;"
+            " background: #f6f6f6;"
+            "}"
+            "QProgressBar::chunk {"
+            " background-color: #5aa9e6;"
+            " border-radius: 4px;"
+            "}"
+        )
 
         self._log_view = QtWidgets.QPlainTextEdit()
         self._log_view.setReadOnly(True)
