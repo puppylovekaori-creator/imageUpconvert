@@ -9,7 +9,7 @@ from .gui import MainWindow
 
 def main() -> int:
     app = QApplication(sys.argv)
-    app.setApplicationName("SwinIR 画像高解像度化 GUI")
+    app.setApplicationName("SwinIR + GIMP 低侵襲高解像度化 GUI")
 
     window = MainWindow()
     window.show()

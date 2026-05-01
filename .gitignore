@@ -22,6 +22,9 @@ failed/*
 !failed/.gitkeep
 
 tmp_input/
+temp/
+config.json
+tools/gimp_pdb_query_out.txt
 
 vendor/SwinIR/__pycache__/
 vendor/SwinIR/**/*.pyc

@@ -4,6 +4,8 @@ import argparse
 import importlib.util
 import json
 import re
+import shutil
+import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -14,7 +16,18 @@ from typing import Any, Callable
 import numpy as np
 
 from .alpha_utils import bleed_transparent_rgb, resize_alpha
-from .crop_utils import center_crop_by_ratio, parse_ratio_text
+from .crop_utils import apply_preview_crop_mode
+from .cutout_utils import apply_person_cutout
+from .gimp_runner import (
+    GimpExecutionResult,
+    NoiseReductionSettings,
+    UnsharpMaskSettings,
+    describe_noise_settings,
+    describe_unsharp_settings,
+    normalize_post_unsharp_preset,
+    run_gimp_processing,
+    validate_gimp_path,
+)
 from .image_io import (
     build_flat_output_path,
     build_output_path,
@@ -24,16 +37,6 @@ from .image_io import (
     save_png,
 )
 from .log_utils import CsvLogger
-from .sharpen_utils import (
-    apply_sharpen,
-    build_sharpen_suffix,
-    get_effective_sharpen_method,
-    get_sharpen_method_label,
-    is_sharpen_enabled,
-    list_sharpen_methods,
-    normalize_sharpen_method,
-    normalize_sharpen_strength,
-)
 
 try:
     import torch
@@ -44,11 +47,15 @@ else:
     TORCH_IMPORT_ERROR = None
 
 
-VENDOR_NETWORK_PATH = (
-    Path(__file__).resolve().parent.parent / "vendor" / "SwinIR" / "models" / "network_swinir.py"
-)
-DEFAULT_COMPARISON_SHARPEN_METHODS = list_sharpen_methods()
-DEFAULT_COMPARISON_SHARPEN_STRENGTHS = ("none", "weak", "medium")
+APP_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_MODELS_BY_SCALE = {
+    2: APP_ROOT / "models" / "swinir" / "001_classicalSR_DF2K_s64w8_SwinIR-M_x2.pth",
+    4: APP_ROOT / "models" / "swinir" / "001_classicalSR_DF2K_s64w8_SwinIR-M_x4.pth",
+}
+VENDOR_NETWORK_PATH = APP_ROOT / "vendor" / "SwinIR" / "models" / "network_swinir.py"
+PREVIEW_ROOT = APP_ROOT / "temp" / "preview"
+WHO_VALUE = "imageUpconvert"
+SUPPORTED_PREVIEW_RANGES = {"full", "center", "face_near"}
 
 
 class UserCancelledError(RuntimeError):
@@ -56,43 +63,49 @@ class UserCancelledError(RuntimeError):
 
 
 @dataclass(slots=True)
-class CropOptions:
-    enabled: bool = False
-    ratio: str = "4:5"
+class PipelineOptions:
+    scale: int
+    tile_size: int
+    tile_overlap: int
+    gimp_path: Path | None = None
+    use_gimp_pre: bool = True
+    noise_settings: NoiseReductionSettings = field(default_factory=NoiseReductionSettings)
+    pre_unsharp_settings: UnsharpMaskSettings = field(default_factory=UnsharpMaskSettings)
+    use_gimp_post: bool = False
+    post_unsharp_settings: UnsharpMaskSettings = field(
+        default_factory=lambda: UnsharpMaskSettings(preset="off")
+    )
+    use_cutout: bool = False
 
 
 @dataclass(slots=True)
 class BatchOptions:
     input_dir: Path
     output_dir: Path
-    model_path: Path
-    scale: int
-    tile_size: int
-    tile_overlap: int
-    skip_existing: bool
     recursive: bool
+    skip_existing: bool
     collision_policy: str
-    sharpen_method: str = "unsharp"
-    sharpen_strength: str = "weak"
-    crop_options: CropOptions = field(default_factory=CropOptions)
+    pipeline: PipelineOptions
     test_mode: bool = False
     test_limit: int = 5
+
+
+@dataclass(slots=True)
+class PreviewOptions:
+    input_file: Path
+    preview_range: str
+    preview_ratio: str
+    pipeline: PipelineOptions
+    preview_dir: Path = PREVIEW_ROOT
 
 
 @dataclass(slots=True)
 class ComparisonOptions:
     input_file: Path
     output_dir: Path
-    model_paths_by_scale: dict[int, Path]
-    tile_size: int
-    tile_overlap: int
     skip_existing: bool
     collision_policy: str
-    sharpen_methods: tuple[str, ...] = DEFAULT_COMPARISON_SHARPEN_METHODS
-    sharpen_strengths: tuple[str, ...] = DEFAULT_COMPARISON_SHARPEN_STRENGTHS
-    include_full_image: bool = True
-    include_crop_image: bool = True
-    crop_ratio: str = "4:5"
+    pipeline: PipelineOptions
 
 
 @dataclass(slots=True)
@@ -107,6 +120,7 @@ class ModelDescriptor:
 
 @dataclass(slots=True)
 class RunSummary:
+    kind: str
     total_files: int
     processed: int
     skipped: int
@@ -118,6 +132,19 @@ class RunSummary:
 
 
 @dataclass(slots=True)
+class PreviewSummary:
+    kind: str
+    input_file: str
+    preview_range: str
+    scale: int
+    original_preview_path: str
+    gimp_pre_preview_path: str
+    swinir_preview_path: str
+    post_preview_path: str
+    message: str
+
+
+@dataclass(slots=True)
 class PreparedImage:
     rgb: np.ndarray
     alpha: np.ndarray | None
@@ -126,19 +153,33 @@ class PreparedImage:
     processing_width: int
     processing_height: int
     alpha_present: str
-    crop_enabled: str
-    crop_range: str
+    preview_range: str
+    preview_crop_range: str
 
 
-@dataclass(frozen=True, slots=True)
-class VariantPlan:
-    label: str
-    model_path: Path
-    scale: int
-    crop_options: CropOptions
-    sharpen_method: str
-    sharpen_strength: str
-    suffix: str
+@dataclass(slots=True)
+class ImageState:
+    rgb: np.ndarray
+    alpha: np.ndarray | None
+
+
+@dataclass(slots=True)
+class StageLog:
+    used: bool = False
+    exit_code: int = 0
+    stdout: str = ""
+    stderr: str = ""
+    version_text: str = ""
+
+
+@dataclass(slots=True)
+class PipelineExecutionResult:
+    prepared: PreparedImage
+    final_state: ImageState
+    actual_scale: str
+    warning_message: str
+    gimp_pre_log: StageLog
+    gimp_post_log: StageLog
 
 
 class InterruptController:
@@ -168,14 +209,15 @@ class ModelRuntimeCache:
     def device(self) -> Any:
         return self._device
 
-    def get(self, model_path: Path, scale: int) -> tuple[ModelDescriptor, Any]:
+    def get(self, scale: int) -> tuple[ModelDescriptor, Any]:
+        model_path = get_default_model_path(scale)
         key = (str(model_path.resolve()), scale)
         if key not in self._cache:
             descriptor = infer_model_descriptor(model_path, scale)
             model = define_model(descriptor, model_path, self._device)
             self._cache[key] = (descriptor, model)
             self._message_callback(
-                f"モデル読込: {model_path.name} / {descriptor.label} / x{descriptor.scale}"
+                f"内部モデル読込: {model_path.name} / {descriptor.label} / x{descriptor.scale}"
             )
         return self._cache[key]
 
@@ -202,7 +244,9 @@ def infer_model_descriptor(model_path: Path, requested_scale: int) -> ModelDescr
 
     if "classicalsr" in name or name.startswith("001_"):
         task = "classical_sr"
-        training_patch_size = int(re.search(r"_s(\d+)w", name).group(1)) if re.search(r"_s(\d+)w", name) else 64
+        training_patch_size = (
+            int(re.search(r"_s(\d+)w", name).group(1)) if re.search(r"_s(\d+)w", name) else 64
+        )
         large_model = False
         label = "classical_sr"
     elif "lightweightsr" in name or name.startswith("002_"):
@@ -228,7 +272,6 @@ def infer_model_descriptor(model_path: Path, requested_scale: int) -> ModelDescr
         raise ValueError(
             f"選択した倍率 x{requested_scale} と、モデル名から判定した倍率 x{detected_scale} が一致しません。"
         )
-
     if task == "real_sr" and requested_scale != 4:
         raise ValueError("公式の real_sr モデルは x4 のみ対応です。")
 
@@ -247,6 +290,135 @@ def ensure_torch_available() -> None:
         raise RuntimeError(
             "PyTorch を利用できません。setup.bat を先に実行するか、venv に torch をインストールしてください。"
         ) from TORCH_IMPORT_ERROR
+
+
+def get_default_model_path(scale: int) -> Path:
+    model_path = DEFAULT_MODELS_BY_SCALE.get(scale)
+    if model_path is None:
+        raise ValueError(f"未対応の倍率です: x{scale}")
+    return model_path
+
+
+def list_available_internal_scales() -> list[int]:
+    return [scale for scale, path in DEFAULT_MODELS_BY_SCALE.items() if path.exists()]
+
+
+def validate_pipeline_options(options: PipelineOptions) -> None:
+    if options.scale not in {2, 4}:
+        raise ValueError("倍率は 2x または 4x のみ対応です。")
+    if options.tile_size < 0 or options.tile_overlap < 0:
+        raise ValueError("tile size と tile overlap は 0 以上で指定してください。")
+    model_path = get_default_model_path(options.scale)
+    if not model_path.exists() or not model_path.is_file():
+        raise ValueError(f"内部モデルが見つかりません: {model_path}")
+    if options.use_gimp_pre or options.use_gimp_post:
+        validate_gimp_path(options.gimp_path)
+    normalize_post_unsharp_preset(options.post_unsharp_settings.preset)
+
+
+def validate_batch_options(options: BatchOptions) -> None:
+    if not options.input_dir.exists() or not options.input_dir.is_dir():
+        raise ValueError("入力フォルダが存在しません。")
+    validate_pipeline_options(options.pipeline)
+
+    input_resolved = options.input_dir.resolve()
+    output_resolved = options.output_dir.resolve()
+    if input_resolved == output_resolved or input_resolved in output_resolved.parents:
+        raise ValueError(
+            "出力フォルダは入力フォルダと別にしてください。入力フォルダの内側も指定できません。"
+        )
+
+
+def validate_preview_options(options: PreviewOptions) -> None:
+    if not options.input_file.exists() or not options.input_file.is_file():
+        raise ValueError("プレビュー対象画像が存在しません。")
+    if options.preview_range not in SUPPORTED_PREVIEW_RANGES:
+        raise ValueError("プレビュー範囲は 全体 / 中央crop / 顔付近crop のいずれかを選んでください。")
+    validate_pipeline_options(options.pipeline)
+
+
+def validate_comparison_options(options: ComparisonOptions) -> None:
+    if not options.input_file.exists() or not options.input_file.is_file():
+        raise ValueError("比較対象画像が存在しません。")
+    validate_pipeline_options(options.pipeline)
+
+
+def get_effective_output_dir(options: BatchOptions) -> Path:
+    if not options.test_mode:
+        return options.output_dir
+    return options.output_dir.with_name(f"{options.output_dir.name}_test")
+
+
+def get_comparison_output_dir(output_dir: Path) -> Path:
+    return output_dir.parent / "comparison"
+
+
+def numpy_to_tensor(rgb: np.ndarray, device: Any):
+    chw = np.transpose(rgb, (2, 0, 1))
+    return torch.from_numpy(chw).float().unsqueeze(0).to(device)
+
+
+def tensor_to_numpy(output: Any) -> np.ndarray:
+    array = output.squeeze(0).clamp(0, 1).cpu().numpy()
+    return np.transpose(array, (1, 2, 0))
+
+
+def pad_to_window(img: Any, window_size: int):
+    _, _, h_old, w_old = img.size()
+    h_pad = ((h_old + window_size - 1) // window_size) * window_size - h_old
+    w_pad = ((w_old + window_size - 1) // window_size) * window_size - w_old
+
+    if h_pad > 0:
+        img = torch.cat([img, torch.flip(img, [2])], dim=2)[:, :, : h_old + h_pad, :]
+    if w_pad > 0:
+        img = torch.cat([img, torch.flip(img, [3])], dim=3)[:, :, :, : w_old + w_pad]
+    return img, h_old, w_old
+
+
+def run_model_tiles(
+    img: Any,
+    model: Any,
+    descriptor: ModelDescriptor,
+    tile_size: int,
+    tile_overlap: int,
+    controller: InterruptController,
+):
+    if tile_size <= 0:
+        controller.raise_if_cancelled()
+        return model(img)
+
+    b, c, h, w = img.size()
+    tile = min(tile_size, h, w)
+    tile = (tile // descriptor.window_size) * descriptor.window_size
+    if tile < descriptor.window_size:
+        controller.raise_if_cancelled()
+        return model(img)
+
+    overlap = min(tile_overlap, max(tile - 1, 0))
+    stride = max(tile - overlap, 1)
+    scale = descriptor.scale
+
+    h_idx_list = list(range(0, max(h - tile, 0), stride)) + [h - tile]
+    w_idx_list = list(range(0, max(w - tile, 0), stride)) + [w - tile]
+
+    output_accumulator = torch.zeros(b, c, h * scale, w * scale).type_as(img)
+    weight_accumulator = torch.zeros_like(output_accumulator)
+
+    for h_idx in h_idx_list:
+        for w_idx in w_idx_list:
+            controller.raise_if_cancelled()
+            in_patch = img[..., h_idx : h_idx + tile, w_idx : w_idx + tile]
+            out_patch = model(in_patch)
+            out_patch_mask = torch.ones_like(out_patch)
+
+            output_accumulator[
+                ..., h_idx * scale : (h_idx + tile) * scale, w_idx * scale : (w_idx + tile) * scale
+            ].add_(out_patch)
+            weight_accumulator[
+                ..., h_idx * scale : (h_idx + tile) * scale, w_idx * scale : (w_idx + tile) * scale
+            ].add_(out_patch_mask)
+
+    return output_accumulator.div_(weight_accumulator)
 
 
 def load_checkpoint(model_path: Path, device: Any) -> dict[str, Any]:
@@ -329,132 +501,6 @@ def define_model(descriptor: ModelDescriptor, model_path: Path, device: Any):
     return model.to(device)
 
 
-def validate_options(options: BatchOptions) -> None:
-    if not options.input_dir.exists() or not options.input_dir.is_dir():
-        raise ValueError("入力フォルダが存在しません。")
-    if not options.model_path.exists() or not options.model_path.is_file():
-        raise ValueError("モデルファイルが存在しません。")
-    if options.scale not in {2, 4}:
-        raise ValueError("倍率は 2 または 4 を選んでください。")
-    if options.tile_size < 0 or options.tile_overlap < 0:
-        raise ValueError("tile size と tile overlap は 0 以上で指定してください。")
-
-    input_resolved = options.input_dir.resolve()
-    output_resolved = options.output_dir.resolve()
-    if input_resolved == output_resolved or input_resolved in output_resolved.parents:
-        raise ValueError(
-            "出力フォルダは入力フォルダと別にしてください。入力フォルダの内側も指定できません。"
-        )
-
-    normalize_sharpen_method(options.sharpen_method)
-    normalize_sharpen_strength(options.sharpen_strength)
-    if options.crop_options.enabled:
-        parse_ratio_text(options.crop_options.ratio)
-
-
-def validate_comparison_options(options: ComparisonOptions) -> None:
-    if not options.input_file.exists() or not options.input_file.is_file():
-        raise ValueError("比較対象の画像ファイルが存在しません。")
-    if options.input_file.suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp"}:
-        raise ValueError("比較対象は .jpg / .jpeg / .png / .webp のみ対応です。")
-    if options.tile_size < 0 or options.tile_overlap < 0:
-        raise ValueError("tile size と tile overlap は 0 以上で指定してください。")
-    if 2 not in options.model_paths_by_scale or 4 not in options.model_paths_by_scale:
-        raise ValueError("比較処理には x2 と x4 の両方のモデルが必要です。")
-    for scale, model_path in options.model_paths_by_scale.items():
-        if scale not in {2, 4}:
-            raise ValueError("比較処理で使える倍率は 2x / 4x のみです。")
-        if not model_path.exists() or not model_path.is_file():
-            raise ValueError(f"x{scale} 用モデルファイルが存在しません。")
-        infer_model_descriptor(model_path, scale)
-    if not options.include_full_image and not options.include_crop_image:
-        raise ValueError("比較処理では、全体版または crop 版の少なくともどちらかを有効にしてください。")
-    for sharpen_method in options.sharpen_methods:
-        normalize_sharpen_method(sharpen_method)
-    for sharpen_strength in options.sharpen_strengths:
-        normalize_sharpen_strength(sharpen_strength)
-    if options.include_crop_image:
-        parse_ratio_text(options.crop_ratio)
-
-
-def get_effective_output_dir(options: BatchOptions) -> Path:
-    if not options.test_mode:
-        return options.output_dir
-    return options.output_dir.with_name(f"{options.output_dir.name}_test")
-
-
-def get_comparison_output_dir(output_dir: Path) -> Path:
-    return output_dir.parent / "comparison"
-
-
-def numpy_to_tensor(rgb: np.ndarray, device: Any):
-    chw = np.transpose(rgb, (2, 0, 1))
-    return torch.from_numpy(chw).float().unsqueeze(0).to(device)
-
-
-def tensor_to_numpy(output: Any) -> np.ndarray:
-    array = output.squeeze(0).clamp(0, 1).cpu().numpy()
-    return np.transpose(array, (1, 2, 0))
-
-
-def pad_to_window(img: Any, window_size: int):
-    _, _, h_old, w_old = img.size()
-    h_pad = ((h_old + window_size - 1) // window_size) * window_size - h_old
-    w_pad = ((w_old + window_size - 1) // window_size) * window_size - w_old
-
-    if h_pad > 0:
-        img = torch.cat([img, torch.flip(img, [2])], dim=2)[:, :, : h_old + h_pad, :]
-    if w_pad > 0:
-        img = torch.cat([img, torch.flip(img, [3])], dim=3)[:, :, :, : w_old + w_pad]
-    return img, h_old, w_old
-
-
-def run_model_tiles(
-    img: Any,
-    model: Any,
-    descriptor: ModelDescriptor,
-    tile_size: int,
-    tile_overlap: int,
-    controller: InterruptController,
-):
-    if tile_size <= 0:
-        controller.raise_if_cancelled()
-        return model(img)
-
-    b, c, h, w = img.size()
-    tile = min(tile_size, h, w)
-    tile = (tile // descriptor.window_size) * descriptor.window_size
-    if tile < descriptor.window_size:
-        controller.raise_if_cancelled()
-        return model(img)
-
-    overlap = min(tile_overlap, max(tile - 1, 0))
-    stride = max(tile - overlap, 1)
-    scale = descriptor.scale
-
-    h_idx_list = list(range(0, max(h - tile, 0), stride)) + [h - tile]
-    w_idx_list = list(range(0, max(w - tile, 0), stride)) + [w - tile]
-
-    output_accumulator = torch.zeros(b, c, h * scale, w * scale).type_as(img)
-    weight_accumulator = torch.zeros_like(output_accumulator)
-
-    for h_idx in h_idx_list:
-        for w_idx in w_idx_list:
-            controller.raise_if_cancelled()
-            in_patch = img[..., h_idx : h_idx + tile, w_idx : w_idx + tile]
-            out_patch = model(in_patch)
-            out_patch_mask = torch.ones_like(out_patch)
-
-            output_accumulator[
-                ..., h_idx * scale : (h_idx + tile) * scale, w_idx * scale : (w_idx + tile) * scale
-            ].add_(out_patch)
-            weight_accumulator[
-                ..., h_idx * scale : (h_idx + tile) * scale, w_idx * scale : (w_idx + tile) * scale
-            ].add_(out_patch_mask)
-
-    return output_accumulator.div_(weight_accumulator)
-
-
 def upscale_rgb(
     rgb: np.ndarray,
     model: Any,
@@ -479,68 +525,6 @@ def upscale_rgb(
     return tensor_to_numpy(output)
 
 
-def make_log_row(
-    *,
-    processed_at: str,
-    input_path: Path,
-    output_path: Path | None,
-    original_size: str,
-    processing_input_size: str,
-    output_size: str,
-    requested_scale: int,
-    actual_scale: str,
-    model_path: Path,
-    tile_size: int,
-    tile_overlap: int,
-    alpha_present: str,
-    crop_enabled: str,
-    crop_range: str,
-    sharpen_enabled: str,
-    sharpen_method: str,
-    sharpen_strength: str,
-    result: str,
-    warning_message: str,
-    error_message: str,
-    elapsed_seconds: float,
-) -> dict[str, str]:
-    return {
-        "processed_at": processed_at,
-        "input_file_path": str(input_path),
-        "output_file_path": str(output_path) if output_path else "",
-        "original_image_size": original_size,
-        "processing_input_size": processing_input_size,
-        "output_image_size": output_size,
-        "requested_scale": str(requested_scale),
-        "actual_scale": actual_scale,
-        "model": str(model_path),
-        "tile_size": str(tile_size),
-        "tile_overlap": str(tile_overlap),
-        "alpha_present": alpha_present,
-        "crop_enabled": crop_enabled,
-        "crop_range": crop_range,
-        "sharpen_enabled": sharpen_enabled,
-        "sharpen_method": sharpen_method,
-        "sharpen_strength": sharpen_strength,
-        "processing_result": result,
-        "warning_message": warning_message,
-        "error_message": error_message,
-        "processing_time_seconds": f"{elapsed_seconds:.3f}",
-    }
-
-
-def build_output_suffix(
-    *,
-    scale: int,
-    crop_enabled: bool,
-    sharpen_method: str,
-    sharpen_strength: str,
-) -> str:
-    suffix = f"_swinir_x{scale}"
-    if crop_enabled:
-        suffix += "_crop"
-    return suffix + build_sharpen_suffix(sharpen_method, sharpen_strength)
-
-
 def format_size(width: int, height: int) -> str:
     return f"{width}x{height}"
 
@@ -549,8 +533,6 @@ def format_actual_scale(
     *,
     processing_width: int,
     processing_height: int,
-    expected_width: int,
-    expected_height: int,
     actual_width: int,
     actual_height: int,
     requested_scale: int,
@@ -558,6 +540,8 @@ def format_actual_scale(
     scale_x = actual_width / processing_width if processing_width else 0.0
     scale_y = actual_height / processing_height if processing_height else 0.0
     actual_scale_text = f"{scale_x:.4f}x{scale_y:.4f}"
+    expected_width = processing_width * requested_scale
+    expected_height = processing_height * requested_scale
 
     warning_message = ""
     if actual_width != expected_width or actual_height != expected_height:
@@ -568,48 +552,88 @@ def format_actual_scale(
     return actual_scale_text, warning_message
 
 
-def prepare_image(input_path: Path, crop_options: CropOptions) -> PreparedImage:
+def _log_from_gimp_result(result: GimpExecutionResult | None) -> StageLog:
+    if result is None:
+        return StageLog()
+    return StageLog(
+        used=result.used,
+        exit_code=result.exit_code,
+        stdout=result.stdout,
+        stderr=result.stderr,
+        version_text=result.version_text,
+    )
+
+
+def _save_state(path: Path, state: ImageState) -> None:
+    save_png(path, state.rgb, state.alpha)
+
+
+def prepare_image(
+    input_path: Path,
+    *,
+    preview_range: str,
+    preview_ratio: str,
+) -> PreparedImage:
     loaded = load_image(input_path)
-    rgb = loaded.rgb
-    alpha = loaded.alpha
-    crop_enabled_text = "no"
-    crop_range = ""
-
-    if crop_options.enabled:
-        crop_result = center_crop_by_ratio(rgb, alpha, crop_options.ratio)
-        rgb = crop_result.rgb
-        alpha = crop_result.alpha
-        crop_enabled_text = "yes"
-        crop_range = crop_result.format_range()
-
-    prepared_rgb = bleed_transparent_rgb(rgb, alpha)
-    height, width = prepared_rgb.shape[:2]
+    crop_result = apply_preview_crop_mode(
+        loaded.rgb,
+        loaded.alpha,
+        mode=preview_range,
+        ratio_text=preview_ratio,
+    )
+    height, width = crop_result.rgb.shape[:2]
     return PreparedImage(
-        rgb=prepared_rgb,
-        alpha=alpha,
+        rgb=crop_result.rgb,
+        alpha=crop_result.alpha,
         original_width=loaded.width,
         original_height=loaded.height,
         processing_width=width,
         processing_height=height,
-        alpha_present="yes" if alpha is not None else "no",
-        crop_enabled=crop_enabled_text,
-        crop_range=crop_range,
+        alpha_present="yes" if crop_result.alpha is not None else "no",
+        preview_range=crop_result.mode,
+        preview_crop_range=crop_result.format_range(),
     )
 
 
-def execute_variant(
+def _apply_gimp_stage(
     *,
-    prepared_image: PreparedImage,
-    plan: VariantPlan,
-    output_path: Path,
+    state: ImageState,
+    gimp_path: Path,
+    noise_settings: NoiseReductionSettings,
+    unsharp_settings: UnsharpMaskSettings,
+    temp_dir: Path,
+    prefix: str,
+    controller: InterruptController,
+) -> tuple[ImageState, StageLog]:
+    controller.raise_if_cancelled()
+    input_path = temp_dir / f"{prefix}_input.png"
+    output_path = temp_dir / f"{prefix}_output.png"
+    _save_state(input_path, state)
+    result = run_gimp_processing(
+        gimp_path=gimp_path,
+        input_path=input_path,
+        output_path=output_path,
+        noise_settings=noise_settings,
+        unsharp_settings=unsharp_settings,
+    )
+    controller.raise_if_cancelled()
+    loaded = load_image(output_path)
+    return ImageState(rgb=loaded.rgb, alpha=loaded.alpha), _log_from_gimp_result(result)
+
+
+def _upscale_state(
+    *,
+    state: ImageState,
+    scale: int,
     tile_size: int,
     tile_overlap: int,
     model_cache: ModelRuntimeCache,
     controller: InterruptController,
-) -> tuple[str, str, str]:
-    descriptor, model = model_cache.get(plan.model_path, plan.scale)
+) -> tuple[ImageState, str, str]:
+    descriptor, model = model_cache.get(scale)
+    prepared_rgb = bleed_transparent_rgb(state.rgb, state.alpha)
     output_rgb = upscale_rgb(
-        prepared_image.rgb,
+        prepared_rgb,
         model=model,
         descriptor=descriptor,
         device=model_cache.device,
@@ -617,31 +641,186 @@ def execute_variant(
         tile_overlap=tile_overlap,
         controller=controller,
     )
-    output_rgb = apply_sharpen(output_rgb, plan.sharpen_method, plan.sharpen_strength)
-    output_alpha = resize_alpha(prepared_image.alpha, plan.scale) if prepared_image.alpha is not None else None
-
+    output_alpha = resize_alpha(state.alpha, scale) if state.alpha is not None else None
     actual_height, actual_width = output_rgb.shape[:2]
-    expected_width = prepared_image.processing_width * plan.scale
-    expected_height = prepared_image.processing_height * plan.scale
+    processing_height, processing_width = state.rgb.shape[:2]
     actual_scale, warning_message = format_actual_scale(
-        processing_width=prepared_image.processing_width,
-        processing_height=prepared_image.processing_height,
-        expected_width=expected_width,
-        expected_height=expected_height,
+        processing_width=processing_width,
+        processing_height=processing_height,
         actual_width=actual_width,
         actual_height=actual_height,
-        requested_scale=plan.scale,
+        requested_scale=scale,
     )
+    return ImageState(output_rgb, output_alpha), actual_scale, warning_message
 
-    if output_alpha is not None:
-        alpha_height, alpha_width = output_alpha.shape[:2]
-        if alpha_width != actual_width or alpha_height != actual_height:
-            raise ValueError(
-                f"alpha 出力サイズが RGB と一致しません。RGB={actual_width}x{actual_height}, alpha={alpha_width}x{alpha_height}"
+
+def execute_pipeline(
+    *,
+    input_path: Path,
+    pipeline: PipelineOptions,
+    model_cache: ModelRuntimeCache,
+    controller: InterruptController,
+    preview_range: str = "full",
+    preview_ratio: str = "4:5",
+) -> PipelineExecutionResult:
+    prepared = prepare_image(
+        input_path,
+        preview_range=preview_range,
+        preview_ratio=preview_ratio,
+    )
+    original_state = ImageState(prepared.rgb, prepared.alpha)
+    gimp_pre_log = StageLog()
+    gimp_post_log = StageLog()
+
+    temp_dir = _make_work_dir("imageupconvert_")
+    try:
+        gimp_pre_state = original_state
+        if pipeline.use_gimp_pre:
+            controller.raise_if_cancelled()
+            gimp_pre_state, gimp_pre_log = _apply_gimp_stage(
+                state=original_state,
+                gimp_path=Path(pipeline.gimp_path) if pipeline.gimp_path is not None else None,  # type: ignore[arg-type]
+                noise_settings=pipeline.noise_settings,
+                unsharp_settings=pipeline.pre_unsharp_settings,
+                temp_dir=temp_dir,
+                prefix="gimp_pre",
+                controller=controller,
             )
 
-    save_png(output_path, output_rgb, output_alpha)
-    return format_size(actual_width, actual_height), actual_scale, warning_message
+        upscaled_state, actual_scale, warning_message = _upscale_state(
+            state=gimp_pre_state,
+            scale=pipeline.scale,
+            tile_size=pipeline.tile_size,
+            tile_overlap=pipeline.tile_overlap,
+            model_cache=model_cache,
+            controller=controller,
+        )
+
+        final_state = upscaled_state
+        if pipeline.use_gimp_post:
+            controller.raise_if_cancelled()
+            final_state, gimp_post_log = _apply_gimp_stage(
+                state=final_state,
+                gimp_path=Path(pipeline.gimp_path) if pipeline.gimp_path is not None else None,  # type: ignore[arg-type]
+                noise_settings=NoiseReductionSettings(preset="off"),
+                unsharp_settings=pipeline.post_unsharp_settings,
+                temp_dir=temp_dir,
+                prefix="gimp_post",
+                controller=controller,
+            )
+
+        if pipeline.use_cutout:
+            controller.raise_if_cancelled()
+            cutout_rgb, cutout_alpha = apply_person_cutout(final_state.rgb, final_state.alpha)
+            final_state = ImageState(cutout_rgb, cutout_alpha)
+
+        return PipelineExecutionResult(
+            prepared=prepared,
+            final_state=final_state,
+            actual_scale=actual_scale,
+            warning_message=warning_message,
+            gimp_pre_log=gimp_pre_log,
+            gimp_post_log=gimp_post_log,
+        )
+    finally:
+        _cleanup_work_dir(temp_dir)
+
+
+def make_log_row(
+    *,
+    task_kind: str,
+    processed_at: str,
+    input_path: Path,
+    output_path: Path | None,
+    original_size: str,
+    processing_input_size: str,
+    output_size: str,
+    requested_scale: int,
+    actual_scale: str,
+    model_path: Path,
+    pipeline: PipelineOptions,
+    prepared: PreparedImage | None,
+    gimp_pre_log: StageLog,
+    gimp_post_log: StageLog,
+    result: str,
+    warning_message: str,
+    error_message: str,
+    elapsed_seconds: float,
+) -> dict[str, str]:
+    return {
+        "who": WHO_VALUE,
+        "processed_at": processed_at,
+        "task_kind": task_kind,
+        "input_file_path": str(input_path),
+        "output_file_path": str(output_path) if output_path else "",
+        "original_image_size": original_size,
+        "processing_input_size": processing_input_size,
+        "output_image_size": output_size,
+        "requested_scale": str(requested_scale),
+        "actual_scale": actual_scale,
+        "model": str(model_path),
+        "tile_size": str(pipeline.tile_size),
+        "tile_overlap": str(pipeline.tile_overlap),
+        "alpha_present": prepared.alpha_present if prepared is not None else "",
+        "preview_range": prepared.preview_range if prepared is not None else "",
+        "preview_crop_range": prepared.preview_crop_range if prepared is not None else "",
+        "gimp_path": str(pipeline.gimp_path) if pipeline.gimp_path else "",
+        "gimp_version": gimp_post_log.version_text or gimp_pre_log.version_text,
+        "gimp_pre_enabled": "yes" if pipeline.use_gimp_pre else "no",
+        "noise_reduction_setting": describe_noise_settings(pipeline.noise_settings),
+        "unsharp_pre_setting": describe_unsharp_settings(pipeline.pre_unsharp_settings),
+        "gimp_post_enabled": "yes" if pipeline.use_gimp_post else "no",
+        "unsharp_post_setting": describe_unsharp_settings(
+            pipeline.post_unsharp_settings, allow_detail=False
+        ),
+        "cutout_enabled": "yes" if pipeline.use_cutout else "no",
+        "gimp_pre_exit_code": str(gimp_pre_log.exit_code) if gimp_pre_log.used else "",
+        "gimp_pre_stdout": gimp_pre_log.stdout.replace("\r", " ").replace("\n", " ").strip(),
+        "gimp_pre_stderr": gimp_pre_log.stderr.replace("\r", " ").replace("\n", " ").strip(),
+        "gimp_post_exit_code": str(gimp_post_log.exit_code) if gimp_post_log.used else "",
+        "gimp_post_stdout": gimp_post_log.stdout.replace("\r", " ").replace("\n", " ").strip(),
+        "gimp_post_stderr": gimp_post_log.stderr.replace("\r", " ").replace("\n", " ").strip(),
+        "processing_result": result,
+        "warning_message": warning_message,
+        "error_message": error_message,
+        "processing_time_seconds": f"{elapsed_seconds:.3f}",
+    }
+
+
+def _build_batch_output_suffix(pipeline: PipelineOptions) -> str:
+    suffix = f"_swinir_x{pipeline.scale}"
+    if pipeline.use_gimp_pre:
+        suffix += "_gimp_pre"
+    if pipeline.use_gimp_post:
+        suffix += "_gimp_post"
+    if pipeline.use_cutout:
+        suffix += "_cutout"
+    return suffix
+
+
+def _make_temp_output_path(output_path: Path) -> Path:
+    return output_path.with_name(f"{output_path.stem}.tmp{output_path.suffix}")
+
+
+def _save_final_output(output_path: Path, state: ImageState) -> None:
+    temp_output_path = _make_temp_output_path(output_path)
+    if temp_output_path.exists():
+        temp_output_path.unlink()
+    save_png(temp_output_path, state.rgb, state.alpha)
+    temp_output_path.replace(output_path)
+
+
+def _make_work_dir(prefix: str) -> Path:
+    temp_root = APP_ROOT / "temp"
+    temp_root.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix=prefix, dir=temp_root))
+
+
+def _cleanup_work_dir(path: Path) -> None:
+    try:
+        shutil.rmtree(path, ignore_errors=True)
+    except Exception:
+        return
 
 
 def run_batch(
@@ -652,7 +831,7 @@ def run_batch(
     controller: InterruptController | None = None,
 ) -> RunSummary:
     ensure_torch_available()
-    validate_options(options)
+    validate_batch_options(options)
 
     progress_callback = progress_callback or (lambda payload: None)
     message_callback = message_callback or (lambda message: None)
@@ -670,22 +849,10 @@ def run_batch(
         raise ValueError("入力フォルダ内に対応画像が見つかりませんでした。")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    message_callback(f"出力先: {output_dir}")
-    message_callback(f"使用デバイス: {device}")
-    message_callback(
-        "crop: "
-        + (
-            f"ON ({options.crop_options.ratio})"
-            if options.crop_options.enabled
-            else "OFF"
-        )
-    )
-    message_callback(
-        "シャープ処理: "
-        f"{get_sharpen_method_label(options.sharpen_method)} / {normalize_sharpen_strength(options.sharpen_strength)}"
-    )
-
+    model_cache = ModelRuntimeCache(device, message_callback)
+    logger = CsvLogger(output_dir)
     summary = RunSummary(
+        kind="run",
         total_files=len(files),
         processed=0,
         skipped=0,
@@ -695,26 +862,11 @@ def run_batch(
         cancelled=False,
         output_dir=str(output_dir),
     )
-    logger = CsvLogger(output_dir)
-    model_cache = ModelRuntimeCache(device, message_callback)
-    plan = VariantPlan(
-        label=(
-            f"x{options.scale} / "
-            f"{get_sharpen_method_label(options.sharpen_method)} / "
-            f"{normalize_sharpen_strength(options.sharpen_strength)}"
-        ),
-        model_path=options.model_path,
-        scale=options.scale,
-        crop_options=options.crop_options,
-        sharpen_method=options.sharpen_method,
-        sharpen_strength=normalize_sharpen_strength(options.sharpen_strength),
-        suffix=build_output_suffix(
-            scale=options.scale,
-            crop_enabled=options.crop_options.enabled,
-            sharpen_method=options.sharpen_method,
-            sharpen_strength=options.sharpen_strength,
-        ),
-    )
+
+    model_path = get_default_model_path(options.pipeline.scale)
+    message_callback(f"出力先: {output_dir}")
+    message_callback(f"使用デバイス: {device}")
+    message_callback(f"内部モデル: {model_path.name}")
 
     try:
         for index, input_path in enumerate(files, start=1):
@@ -732,37 +884,33 @@ def run_batch(
                     "path": str(input_path),
                 }
             )
-
             processed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             started_at = time.perf_counter()
             output_path = build_output_path(
                 input_path=input_path,
                 input_root=options.input_dir,
                 output_root=output_dir,
-                suffix=plan.suffix,
+                suffix=_build_batch_output_suffix(options.pipeline),
                 collision_policy=options.collision_policy,
                 skip_existing=options.skip_existing,
             )
 
             if output_path is None:
                 row = make_log_row(
+                    task_kind="batch",
                     processed_at=processed_at,
                     input_path=input_path,
                     output_path=None,
                     original_size="",
                     processing_input_size="",
                     output_size="",
-                    requested_scale=options.scale,
+                    requested_scale=options.pipeline.scale,
                     actual_scale="",
-                    model_path=options.model_path,
-                    tile_size=options.tile_size,
-                    tile_overlap=options.tile_overlap,
-                    alpha_present="",
-                    crop_enabled="yes" if options.crop_options.enabled else "no",
-                    crop_range=options.crop_options.ratio if options.crop_options.enabled else "",
-                    sharpen_enabled="yes" if is_sharpen_enabled(options.sharpen_method, options.sharpen_strength) else "no",
-                    sharpen_method=get_effective_sharpen_method(options.sharpen_method, options.sharpen_strength),
-                    sharpen_strength=normalize_sharpen_strength(options.sharpen_strength),
+                    model_path=model_path,
+                    pipeline=options.pipeline,
+                    prepared=None,
+                    gimp_pre_log=StageLog(),
+                    gimp_post_log=StageLog(),
                     result="skipped",
                     warning_message="",
                     error_message="同名の出力ファイルが既にあるためスキップしました。",
@@ -782,45 +930,42 @@ def run_batch(
                 continue
 
             try:
-                prepared = prepare_image(input_path, options.crop_options)
-                output_size, actual_scale, warning_message = execute_variant(
-                    prepared_image=prepared,
-                    plan=plan,
-                    output_path=output_path,
-                    tile_size=options.tile_size,
-                    tile_overlap=options.tile_overlap,
+                result = execute_pipeline(
+                    input_path=input_path,
+                    pipeline=options.pipeline,
                     model_cache=model_cache,
                     controller=controller,
                 )
-                result = "processed_warning" if warning_message else "processed"
+                _save_final_output(output_path, result.final_state)
+                output_height, output_width = result.final_state.rgb.shape[:2]
+                row_result = "processed_warning" if result.warning_message else "processed"
                 row = make_log_row(
+                    task_kind="batch",
                     processed_at=processed_at,
                     input_path=input_path,
                     output_path=output_path,
-                    original_size=format_size(prepared.original_width, prepared.original_height),
-                    processing_input_size=format_size(prepared.processing_width, prepared.processing_height),
-                    output_size=output_size,
-                    requested_scale=options.scale,
-                    actual_scale=actual_scale,
-                    model_path=options.model_path,
-                    tile_size=options.tile_size,
-                    tile_overlap=options.tile_overlap,
-                    alpha_present=prepared.alpha_present,
-                    crop_enabled=prepared.crop_enabled,
-                    crop_range=prepared.crop_range,
-                    sharpen_enabled="yes" if is_sharpen_enabled(options.sharpen_method, options.sharpen_strength) else "no",
-                    sharpen_method=get_effective_sharpen_method(options.sharpen_method, options.sharpen_strength),
-                    sharpen_strength=normalize_sharpen_strength(options.sharpen_strength),
-                    result=result,
-                    warning_message=warning_message,
+                    original_size=format_size(result.prepared.original_width, result.prepared.original_height),
+                    processing_input_size=format_size(
+                        result.prepared.processing_width, result.prepared.processing_height
+                    ),
+                    output_size=format_size(output_width, output_height),
+                    requested_scale=options.pipeline.scale,
+                    actual_scale=result.actual_scale,
+                    model_path=model_path,
+                    pipeline=options.pipeline,
+                    prepared=result.prepared,
+                    gimp_pre_log=result.gimp_pre_log,
+                    gimp_post_log=result.gimp_post_log,
+                    result=row_result,
+                    warning_message=result.warning_message,
                     error_message="",
                     elapsed_seconds=time.perf_counter() - started_at,
                 )
                 logger.log_processing(row)
                 summary.processed += 1
-                if warning_message:
+                if result.warning_message:
                     summary.warnings += 1
-                    message_callback(f"警告付き完了: {input_path.name} / {warning_message}")
+                    message_callback(f"警告付き完了: {input_path.name} / {result.warning_message}")
                 else:
                     message_callback(f"処理完了: {input_path.name}")
                 progress_callback(
@@ -829,7 +974,7 @@ def run_batch(
                         "completed": index,
                         "total": len(files),
                         "path": str(input_path),
-                        "result": result,
+                        "result": row_result,
                     }
                 )
             except UserCancelledError:
@@ -837,23 +982,20 @@ def run_batch(
             except Exception as exc:
                 failed_copy_path = copy_failed_file(input_path, options.input_dir, failed_root)
                 row = make_log_row(
+                    task_kind="batch",
                     processed_at=processed_at,
                     input_path=input_path,
                     output_path=output_path,
                     original_size="",
                     processing_input_size="",
                     output_size="",
-                    requested_scale=options.scale,
+                    requested_scale=options.pipeline.scale,
                     actual_scale="",
-                    model_path=options.model_path,
-                    tile_size=options.tile_size,
-                    tile_overlap=options.tile_overlap,
-                    alpha_present="",
-                    crop_enabled="yes" if options.crop_options.enabled else "no",
-                    crop_range=options.crop_options.ratio if options.crop_options.enabled else "",
-                    sharpen_enabled="yes" if is_sharpen_enabled(options.sharpen_method, options.sharpen_strength) else "no",
-                    sharpen_method=get_effective_sharpen_method(options.sharpen_method, options.sharpen_strength),
-                    sharpen_strength=normalize_sharpen_strength(options.sharpen_strength),
+                    model_path=model_path,
+                    pipeline=options.pipeline,
+                    prepared=None,
+                    gimp_pre_log=StageLog(),
+                    gimp_post_log=StageLog(),
                     result="failed",
                     warning_message="",
                     error_message=f"{exc} | failed_copy={failed_copy_path}",
@@ -881,66 +1023,128 @@ def run_batch(
     return summary
 
 
-def build_comparison_sharpen_variants(
-    options: ComparisonOptions,
-) -> list[tuple[str, str, str]]:
-    variants: list[tuple[str, str, str]] = []
-    normalized_methods = [normalize_sharpen_method(method) for method in options.sharpen_methods]
-    normalized_strengths = [normalize_sharpen_strength(strength) for strength in options.sharpen_strengths]
+def _save_preview_outputs(
+    preview_dir: Path,
+    input_file: Path,
+    *,
+    original_state: ImageState,
+    gimp_pre_state: ImageState,
+    swinir_state: ImageState,
+    post_state: ImageState,
+    scale: int,
+    preview_range: str,
+) -> tuple[Path, Path, Path, Path]:
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    safe_stem = input_file.stem
+    range_suffix = preview_range
+    original_path = preview_dir / f"{safe_stem}_{range_suffix}_original.png"
+    gimp_pre_path = preview_dir / f"{safe_stem}_{range_suffix}_gimp_pre.png"
+    swinir_path = preview_dir / f"{safe_stem}_{range_suffix}_swinir_x{scale}.png"
+    post_path = preview_dir / f"{safe_stem}_{range_suffix}_swinir_x{scale}_gimp_post.png"
+    _save_state(original_path, original_state)
+    _save_state(gimp_pre_path, gimp_pre_state)
+    _save_state(swinir_path, swinir_state)
+    _save_state(post_path, post_state)
+    return original_path, gimp_pre_path, swinir_path, post_path
 
-    if "none" in normalized_strengths:
-        variants.append(("unsharp", "none", "シャープなし"))
 
-    for method in normalized_methods:
-        for strength in normalized_strengths:
-            if strength == "none":
-                continue
-            variants.append(
-                (
-                    method,
-                    strength,
-                    f"{get_sharpen_method_label(method)} / {strength}",
-                )
+def run_preview(
+    options: PreviewOptions,
+    *,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    message_callback: Callable[[str], None] | None = None,
+    controller: InterruptController | None = None,
+) -> PreviewSummary:
+    ensure_torch_available()
+    validate_preview_options(options)
+
+    progress_callback = progress_callback or (lambda payload: None)
+    message_callback = message_callback or (lambda message: None)
+    controller = controller or InterruptController()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model_cache = ModelRuntimeCache(device, message_callback)
+
+    progress_callback({"phase": "started", "completed": 0, "total": 1, "path": str(options.input_file)})
+    prepared = prepare_image(
+        options.input_file,
+        preview_range=options.preview_range,
+        preview_ratio=options.preview_ratio,
+    )
+    original_state = ImageState(prepared.rgb, prepared.alpha)
+    gimp_pre_state = original_state
+
+    temp_dir = _make_work_dir("imageupconvert_preview_")
+    try:
+        if options.pipeline.use_gimp_pre:
+            gimp_pre_state, _ = _apply_gimp_stage(
+                state=original_state,
+                gimp_path=Path(options.pipeline.gimp_path) if options.pipeline.gimp_path is not None else None,  # type: ignore[arg-type]
+                noise_settings=options.pipeline.noise_settings,
+                unsharp_settings=options.pipeline.pre_unsharp_settings,
+                temp_dir=temp_dir,
+                prefix="preview_pre",
+                controller=controller,
             )
-    return variants
 
+        swinir_state, _, _ = _upscale_state(
+            state=original_state,
+            scale=options.pipeline.scale,
+            tile_size=options.pipeline.tile_size,
+            tile_overlap=options.pipeline.tile_overlap,
+            model_cache=model_cache,
+            controller=controller,
+        )
+        post_state = swinir_state
+        if options.pipeline.use_gimp_pre:
+            post_state, _, _ = _upscale_state(
+                state=gimp_pre_state,
+                scale=options.pipeline.scale,
+                tile_size=options.pipeline.tile_size,
+                tile_overlap=options.pipeline.tile_overlap,
+                model_cache=model_cache,
+                controller=controller,
+            )
+        if options.pipeline.use_gimp_post:
+            post_state, _ = _apply_gimp_stage(
+                state=post_state,
+                gimp_path=Path(options.pipeline.gimp_path) if options.pipeline.gimp_path is not None else None,  # type: ignore[arg-type]
+                noise_settings=NoiseReductionSettings(preset="off"),
+                unsharp_settings=options.pipeline.post_unsharp_settings,
+                temp_dir=temp_dir,
+                prefix="preview_post",
+                controller=controller,
+            )
 
-def build_comparison_crop_variants(
-    options: ComparisonOptions,
-) -> list[tuple[str, CropOptions]]:
-    variants: list[tuple[str, CropOptions]] = []
-    if options.include_full_image:
-        variants.append(("全体", CropOptions(enabled=False, ratio=options.crop_ratio)))
-    if options.include_crop_image:
-        variants.append(("crop", CropOptions(enabled=True, ratio=options.crop_ratio)))
-    return variants
+        original_path, gimp_pre_path, swinir_path, post_path = _save_preview_outputs(
+            options.preview_dir,
+            options.input_file,
+            original_state=original_state,
+            gimp_pre_state=gimp_pre_state,
+            swinir_state=swinir_state,
+            post_state=post_state,
+            scale=options.pipeline.scale,
+            preview_range=options.preview_range,
+        )
+    finally:
+        _cleanup_work_dir(temp_dir)
 
-
-def build_comparison_plans(options: ComparisonOptions) -> list[VariantPlan]:
-    plans: list[VariantPlan] = []
-    sharpen_variants = build_comparison_sharpen_variants(options)
-    crop_variants = build_comparison_crop_variants(options)
-    for scope_label, crop_options in crop_variants:
-        for scale in (2, 4):
-            model_path = options.model_paths_by_scale[scale]
-            for sharpen_method, sharpen_strength, sharpen_label in sharpen_variants:
-                plans.append(
-                    VariantPlan(
-                        label=f"{scope_label} / x{scale} / {sharpen_label}",
-                        model_path=model_path,
-                        scale=scale,
-                        crop_options=crop_options,
-                        sharpen_method=sharpen_method,
-                        sharpen_strength=sharpen_strength,
-                        suffix=build_output_suffix(
-                            scale=scale,
-                            crop_enabled=crop_options.enabled,
-                            sharpen_method=sharpen_method,
-                            sharpen_strength=sharpen_strength,
-                        ),
-                    )
-                )
-    return plans
+    progress_callback({"phase": "finished", "completed": 1, "total": 1, "path": str(options.input_file)})
+    message = (
+        f"プレビュー生成完了: {options.input_file.name} / 範囲={options.preview_range} / x{options.pipeline.scale}"
+    )
+    message_callback(message)
+    return PreviewSummary(
+        kind="preview",
+        input_file=str(options.input_file),
+        preview_range=options.preview_range,
+        scale=options.pipeline.scale,
+        original_preview_path=str(original_path),
+        gimp_pre_preview_path=str(gimp_pre_path),
+        swinir_preview_path=str(swinir_path),
+        post_preview_path=str(post_path),
+        message=message,
+    )
 
 
 def run_comparison(
@@ -961,32 +1165,22 @@ def run_comparison(
     output_dir.mkdir(parents=True, exist_ok=True)
     failed_root = output_dir / "failed"
     failed_root.mkdir(parents=True, exist_ok=True)
-
-    plans = build_comparison_plans(options)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger = CsvLogger(output_dir)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_cache = ModelRuntimeCache(device, message_callback)
-    prepared_cache: dict[tuple[bool, str], PreparedImage] = {}
+    model_path = get_default_model_path(options.pipeline.scale)
 
-    message_callback(f"比較出力先: {output_dir}")
-    message_callback(f"比較対象: {options.input_file}")
-    message_callback(f"使用デバイス: {device}")
-    message_callback(
-        "比較バリエーション: "
-        f"全体={'ON' if options.include_full_image else 'OFF'} / "
-        f"crop={'ON' if options.include_crop_image else 'OFF'} ({options.crop_ratio})"
+    variant_specs = (
+        "original",
+        "gimp_pre",
+        "swinir_only",
+        "gimp_pre_swinir",
+        "gimp_pre_swinir_gimp_post",
+        "gimp_pre_swinir_gimp_post_cutout",
     )
-    message_callback(
-        "比較シャープ方式: "
-        + ", ".join(get_sharpen_method_label(method) for method in options.sharpen_methods)
-    )
-    message_callback(
-        "比較シャープ強度: "
-        + ", ".join(normalize_sharpen_strength(strength) for strength in options.sharpen_strengths)
-    )
-
     summary = RunSummary(
-        total_files=len(plans),
+        kind="run",
+        total_files=len(variant_specs),
         processed=0,
         skipped=0,
         failed=0,
@@ -996,164 +1190,215 @@ def run_comparison(
         output_dir=str(output_dir),
     )
 
+    prepared = prepare_image(
+        options.input_file,
+        preview_range="full",
+        preview_ratio="4:5",
+    )
+    original_state = ImageState(prepared.rgb, prepared.alpha)
+    gimp_pre_state = original_state
+    gimp_pre_log = StageLog()
+    gimp_post_log = StageLog()
+
     try:
-        for index, plan in enumerate(plans, start=1):
-            controller.raise_if_cancelled()
-            if controller.should_stop():
-                summary.stopped = True
-                message_callback("停止要求を受け付けました。現在の比較パターン完了後に停止します。")
-                break
-
-            progress_callback(
-                {
-                    "phase": "started",
-                    "completed": index - 1,
-                    "total": len(plans),
-                    "path": f"{options.input_file.name} [{plan.label}]",
-                }
-            )
-
-            processed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            started_at = time.perf_counter()
-            output_path = build_flat_output_path(
-                input_path=options.input_file,
-                output_root=output_dir,
-                suffix=plan.suffix,
-                collision_policy=options.collision_policy,
-                skip_existing=options.skip_existing,
-            )
-
-            if output_path is None:
-                row = make_log_row(
-                    processed_at=processed_at,
-                    input_path=options.input_file,
-                    output_path=None,
-                    original_size="",
-                    processing_input_size="",
-                    output_size="",
-                    requested_scale=plan.scale,
-                    actual_scale="",
-                    model_path=plan.model_path,
-                    tile_size=options.tile_size,
-                    tile_overlap=options.tile_overlap,
-                    alpha_present="",
-                    crop_enabled="yes" if plan.crop_options.enabled else "no",
-                    crop_range=plan.crop_options.ratio if plan.crop_options.enabled else "",
-                    sharpen_enabled="yes" if is_sharpen_enabled(plan.sharpen_method, plan.sharpen_strength) else "no",
-                    sharpen_method=get_effective_sharpen_method(plan.sharpen_method, plan.sharpen_strength),
-                    sharpen_strength=plan.sharpen_strength,
-                    result="skipped",
-                    warning_message="",
-                    error_message="同名の比較出力ファイルが既にあるためスキップしました。",
-                    elapsed_seconds=time.perf_counter() - started_at,
-                )
-                logger.log_processing(row)
-                summary.skipped += 1
-                progress_callback(
-                    {
-                        "phase": "finished",
-                        "completed": index,
-                        "total": len(plans),
-                        "path": f"{options.input_file.name} [{plan.label}]",
-                        "result": "skipped",
-                    }
-                )
-                continue
-
-            try:
-                prepared_key = (plan.crop_options.enabled, plan.crop_options.ratio)
-                if prepared_key not in prepared_cache:
-                    prepared_cache[prepared_key] = prepare_image(options.input_file, plan.crop_options)
-                prepared = prepared_cache[prepared_key]
-                output_size, actual_scale, warning_message = execute_variant(
-                    prepared_image=prepared,
-                    plan=plan,
-                    output_path=output_path,
-                    tile_size=options.tile_size,
-                    tile_overlap=options.tile_overlap,
-                    model_cache=model_cache,
+        temp_dir = _make_work_dir("imageupconvert_compare_")
+        try:
+            if options.pipeline.use_gimp_pre:
+                gimp_pre_state, gimp_pre_log = _apply_gimp_stage(
+                    state=original_state,
+                    gimp_path=Path(options.pipeline.gimp_path) if options.pipeline.gimp_path is not None else None,  # type: ignore[arg-type]
+                    noise_settings=options.pipeline.noise_settings,
+                    unsharp_settings=options.pipeline.pre_unsharp_settings,
+                    temp_dir=temp_dir,
+                    prefix="comparison_pre",
                     controller=controller,
                 )
-                result = "processed_warning" if warning_message else "processed"
-                row = make_log_row(
-                    processed_at=processed_at,
-                    input_path=options.input_file,
-                    output_path=output_path,
-                    original_size=format_size(prepared.original_width, prepared.original_height),
-                    processing_input_size=format_size(prepared.processing_width, prepared.processing_height),
-                    output_size=output_size,
-                    requested_scale=plan.scale,
-                    actual_scale=actual_scale,
-                    model_path=plan.model_path,
-                    tile_size=options.tile_size,
-                    tile_overlap=options.tile_overlap,
-                    alpha_present=prepared.alpha_present,
-                    crop_enabled=prepared.crop_enabled,
-                    crop_range=prepared.crop_range,
-                    sharpen_enabled="yes" if is_sharpen_enabled(plan.sharpen_method, plan.sharpen_strength) else "no",
-                    sharpen_method=get_effective_sharpen_method(plan.sharpen_method, plan.sharpen_strength),
-                    sharpen_strength=plan.sharpen_strength,
-                    result=result,
-                    warning_message=warning_message,
-                    error_message="",
-                    elapsed_seconds=time.perf_counter() - started_at,
+
+            swinir_only_state, _, swinir_only_warning = _upscale_state(
+                state=original_state,
+                scale=options.pipeline.scale,
+                tile_size=options.pipeline.tile_size,
+                tile_overlap=options.pipeline.tile_overlap,
+                model_cache=model_cache,
+                controller=controller,
+            )
+            gimp_pre_swinir_state, actual_scale, pre_swinir_warning = _upscale_state(
+                state=gimp_pre_state,
+                scale=options.pipeline.scale,
+                tile_size=options.pipeline.tile_size,
+                tile_overlap=options.pipeline.tile_overlap,
+                model_cache=model_cache,
+                controller=controller,
+            )
+            gimp_pre_swinir_post_state = gimp_pre_swinir_state
+            if options.pipeline.use_gimp_post:
+                gimp_pre_swinir_post_state, gimp_post_log = _apply_gimp_stage(
+                    state=gimp_pre_swinir_state,
+                    gimp_path=Path(options.pipeline.gimp_path) if options.pipeline.gimp_path is not None else None,  # type: ignore[arg-type]
+                    noise_settings=NoiseReductionSettings(preset="off"),
+                    unsharp_settings=options.pipeline.post_unsharp_settings,
+                    temp_dir=temp_dir,
+                    prefix="comparison_post",
+                    controller=controller,
                 )
-                logger.log_processing(row)
-                summary.processed += 1
-                if warning_message:
-                    summary.warnings += 1
-                    message_callback(f"比較出力 警告付き完了: {plan.label} / {warning_message}")
-                else:
-                    message_callback(f"比較出力完了: {plan.label}")
+            cutout_state = gimp_pre_swinir_post_state
+            if options.pipeline.use_cutout:
+                cutout_rgb, cutout_alpha = apply_person_cutout(cutout_state.rgb, cutout_state.alpha)
+                cutout_state = ImageState(cutout_rgb, cutout_alpha)
+
+            variant_states = {
+                "original": (original_state, "1.0000x1.0000", ""),
+                "gimp_pre": (gimp_pre_state, "1.0000x1.0000", ""),
+                "swinir_only": (swinir_only_state, actual_scale, swinir_only_warning),
+                "gimp_pre_swinir": (gimp_pre_swinir_state, actual_scale, pre_swinir_warning),
+                "gimp_pre_swinir_gimp_post": (
+                    gimp_pre_swinir_post_state,
+                    actual_scale,
+                    pre_swinir_warning,
+                ),
+                "gimp_pre_swinir_gimp_post_cutout": (
+                    cutout_state,
+                    actual_scale,
+                    pre_swinir_warning,
+                ),
+            }
+
+            for index, variant_name in enumerate(variant_specs, start=1):
+                controller.raise_if_cancelled()
+                if controller.should_stop():
+                    summary.stopped = True
+                    message_callback("停止要求を受け付けました。現在の比較パターン完了後に停止します。")
+                    break
+
                 progress_callback(
                     {
-                        "phase": "finished",
-                        "completed": index,
-                        "total": len(plans),
-                        "path": f"{options.input_file.name} [{plan.label}]",
-                        "result": result,
+                        "phase": "started",
+                        "completed": index - 1,
+                        "total": len(variant_specs),
+                        "path": f"{options.input_file.name} [{variant_name}]",
                     }
                 )
-            except UserCancelledError:
-                raise
-            except Exception as exc:
-                failed_copy_path = copy_failed_file(options.input_file, options.input_file.parent, failed_root)
-                row = make_log_row(
-                    processed_at=processed_at,
+                processed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                started_at = time.perf_counter()
+                output_path = build_flat_output_path(
                     input_path=options.input_file,
-                    output_path=output_path,
-                    original_size="",
-                    processing_input_size="",
-                    output_size="",
-                    requested_scale=plan.scale,
-                    actual_scale="",
-                    model_path=plan.model_path,
-                    tile_size=options.tile_size,
-                    tile_overlap=options.tile_overlap,
-                    alpha_present="",
-                    crop_enabled="yes" if plan.crop_options.enabled else "no",
-                    crop_range=plan.crop_options.ratio if plan.crop_options.enabled else "",
-                    sharpen_enabled="yes" if is_sharpen_enabled(plan.sharpen_method, plan.sharpen_strength) else "no",
-                    sharpen_method=get_effective_sharpen_method(plan.sharpen_method, plan.sharpen_strength),
-                    sharpen_strength=plan.sharpen_strength,
-                    result="failed",
-                    warning_message="",
-                    error_message=f"{exc} | failed_copy={failed_copy_path}",
-                    elapsed_seconds=time.perf_counter() - started_at,
+                    output_root=output_dir,
+                    suffix=f"_{variant_name}_x{options.pipeline.scale}",
+                    collision_policy=options.collision_policy,
+                    skip_existing=options.skip_existing,
                 )
-                logger.log_processing(row)
-                logger.log_failed(row)
-                summary.failed += 1
-                message_callback(f"比較出力失敗: {plan.label} -> {exc}")
-                progress_callback(
-                    {
-                        "phase": "finished",
-                        "completed": index,
-                        "total": len(plans),
-                        "path": f"{options.input_file.name} [{plan.label}]",
-                        "result": "failed",
-                    }
-                )
+                if output_path is None:
+                    row = make_log_row(
+                        task_kind="comparison",
+                        processed_at=processed_at,
+                        input_path=options.input_file,
+                        output_path=None,
+                        original_size="",
+                        processing_input_size="",
+                        output_size="",
+                        requested_scale=options.pipeline.scale,
+                        actual_scale="",
+                        model_path=model_path,
+                        pipeline=options.pipeline,
+                        prepared=prepared,
+                        gimp_pre_log=gimp_pre_log,
+                        gimp_post_log=gimp_post_log,
+                        result="skipped",
+                        warning_message="",
+                        error_message="同名の比較出力ファイルが既にあるためスキップしました。",
+                        elapsed_seconds=time.perf_counter() - started_at,
+                    )
+                    logger.log_processing(row)
+                    summary.skipped += 1
+                    progress_callback(
+                        {
+                            "phase": "finished",
+                            "completed": index,
+                            "total": len(variant_specs),
+                            "path": f"{options.input_file.name} [{variant_name}]",
+                            "result": "skipped",
+                        }
+                    )
+                    continue
+
+                try:
+                    state, variant_scale, warning_message = variant_states[variant_name]
+                    _save_final_output(output_path, state)
+                    output_height, output_width = state.rgb.shape[:2]
+                    result_name = "processed_warning" if warning_message else "processed"
+                    row = make_log_row(
+                        task_kind="comparison",
+                        processed_at=processed_at,
+                        input_path=options.input_file,
+                        output_path=output_path,
+                        original_size=format_size(prepared.original_width, prepared.original_height),
+                        processing_input_size=format_size(
+                            prepared.processing_width, prepared.processing_height
+                        ),
+                        output_size=format_size(output_width, output_height),
+                        requested_scale=options.pipeline.scale,
+                        actual_scale=variant_scale,
+                        model_path=model_path,
+                        pipeline=options.pipeline,
+                        prepared=prepared,
+                        gimp_pre_log=gimp_pre_log,
+                        gimp_post_log=gimp_post_log,
+                        result=result_name,
+                        warning_message=warning_message,
+                        error_message="",
+                        elapsed_seconds=time.perf_counter() - started_at,
+                    )
+                    logger.log_processing(row)
+                    summary.processed += 1
+                    if warning_message:
+                        summary.warnings += 1
+                    message_callback(f"比較出力完了: {variant_name}")
+                    progress_callback(
+                        {
+                            "phase": "finished",
+                            "completed": index,
+                            "total": len(variant_specs),
+                            "path": f"{options.input_file.name} [{variant_name}]",
+                            "result": result_name,
+                        }
+                    )
+                except Exception as exc:
+                    failed_copy_path = copy_failed_file(options.input_file, options.input_file.parent, failed_root)
+                    row = make_log_row(
+                        task_kind="comparison",
+                        processed_at=processed_at,
+                        input_path=options.input_file,
+                        output_path=output_path,
+                        original_size="",
+                        processing_input_size="",
+                        output_size="",
+                        requested_scale=options.pipeline.scale,
+                        actual_scale="",
+                        model_path=model_path,
+                        pipeline=options.pipeline,
+                        prepared=prepared,
+                        gimp_pre_log=gimp_pre_log,
+                        gimp_post_log=gimp_post_log,
+                        result="failed",
+                        warning_message="",
+                        error_message=f"{exc} | failed_copy={failed_copy_path}",
+                        elapsed_seconds=time.perf_counter() - started_at,
+                    )
+                    logger.log_processing(row)
+                    logger.log_failed(row)
+                    summary.failed += 1
+                    message_callback(f"比較出力失敗: {variant_name} -> {exc}")
+                    progress_callback(
+                        {
+                            "phase": "finished",
+                            "completed": index,
+                            "total": len(variant_specs),
+                            "path": f"{options.input_file.name} [{variant_name}]",
+                            "result": "failed",
+                        }
+                    )
+        finally:
+            _cleanup_work_dir(temp_dir)
     except UserCancelledError:
         summary.cancelled = True
         message_callback("キャンセルされました。比較出力を中断しました。")
@@ -1167,21 +1412,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="GUI を使わずに SwinIR の一括処理を実行します。")
     parser.add_argument("--input-dir", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
-    parser.add_argument("--model-path", required=True, type=Path)
     parser.add_argument("--scale", required=True, type=int, choices=[2, 4])
     parser.add_argument("--tile-size", type=int, default=400)
     parser.add_argument("--tile-overlap", type=int, default=32)
     parser.add_argument("--recursive", action="store_true")
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--collision-policy", choices=["skip", "serial"], default="skip")
-    parser.add_argument(
-        "--sharpen-method",
-        choices=list_sharpen_methods(),
-        default="unsharp",
-    )
-    parser.add_argument("--sharpen", choices=["none", "weak", "medium", "strong"], default="weak")
-    parser.add_argument("--enable-crop", action="store_true")
-    parser.add_argument("--crop-ratio", default="4:5")
     parser.add_argument("--test-mode", action="store_true")
     parser.add_argument("--test-limit", type=int, default=5)
     return parser
@@ -1192,16 +1428,14 @@ def main() -> int:
     options = BatchOptions(
         input_dir=args.input_dir,
         output_dir=args.output_dir,
-        model_path=args.model_path,
-        scale=args.scale,
-        tile_size=args.tile_size,
-        tile_overlap=args.tile_overlap,
-        skip_existing=args.skip_existing,
         recursive=args.recursive,
+        skip_existing=args.skip_existing,
         collision_policy=args.collision_policy,
-        sharpen_method=args.sharpen_method,
-        sharpen_strength=args.sharpen,
-        crop_options=CropOptions(enabled=args.enable_crop, ratio=args.crop_ratio),
+        pipeline=PipelineOptions(
+            scale=args.scale,
+            tile_size=args.tile_size,
+            tile_overlap=args.tile_overlap,
+        ),
         test_mode=args.test_mode,
         test_limit=args.test_limit,
     )

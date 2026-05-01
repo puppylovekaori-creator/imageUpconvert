@@ -27,8 +27,10 @@ if not exist "%VENV_DIR%\Scripts\python.exe" (
 
 set "VENV_PYTHON=%VENV_DIR%\Scripts\python.exe"
 
-for /d %%D in ("%VENV_DIR%\Lib\site-packages\~ip*") do (
+for %%P in ("%VENV_DIR%\Lib\site-packages\~ip*" "%VENV_DIR%\Lib\site-packages\~il*") do (
+    for /d %%D in ("%%~fP") do (
     rd /s /q "%%~fD"
+    )
 )
 
 "%VENV_PYTHON%" -m ensurepip --upgrade
